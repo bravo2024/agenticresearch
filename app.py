@@ -29,14 +29,21 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+try:
+    # Use the OS certificate store, so HTTPS still verifies on machines whose
+    # antivirus re-signs TLS traffic (Kaspersky, ESET...). Verification stays on.
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
+from plotly.subplots import make_subplots
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG — wide layout, light theme (original style)
@@ -88,11 +95,11 @@ LLM_PROVIDERS = {
         "base": ZEN_BASE,
         "key_env": "OPENCODE_ZEN_API_KEY",
         "max_tokens": 4096,
+        # Fallback only; the live /models list replaces it once fetched.
         "models": [
             "deepseek-v4-flash-free",
-            "mimo-v2.5-free",
-            "ling-3.0-flash-free",
             "nemotron-3-ultra-free",
+            "space-bunny-free",
         ],
         "tag": "free",
         "anonymous": True,  # blank key works — free proxy
@@ -102,11 +109,10 @@ LLM_PROVIDERS = {
         "key_env": "NVIDIA_API_KEY",
         "max_tokens": 8192,
         "models": [
-            "deepseek-ai/deepseek-v4-flash",
-            "deepseek-ai/deepseek-v4-pro",
-            "z-ai/glm-5.2",
-            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-            "minimaxai/minimax-m3",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "deepseek-ai/deepseek-v4.1-flash",
+            "moonshotai/kimi-k3",
         ],
         "tag": "nvidia",
     },
@@ -122,26 +128,51 @@ LLM_PROVIDERS = {
         ],
         "tag": "groq",
     },
+    # Gemini API, free tier only. Free vs paid is decided by the Google Cloud
+    # project behind the key: a key from an AI Studio project with no billing
+    # account linked can never be charged (over quota it returns 429, which
+    # fails over to the next provider). The app also only ever picks Flash /
+    # Flash-Lite text models, which the free tier covers; Pro, image, audio
+    # and live models are never selected. A Google AI Pro subscription does
+    # not apply to the API either way.
+    "gemini-free": {
+        "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_env": "GEMINI_API_KEY",
+        "max_tokens": 8192,
+        "models": [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+        "tag": "gemini",
+    },
     "kilo-free": {
         "base": "https://api.kilo.ai/api/openrouter",
         "key_env": "KILO_API_KEY",
         "max_tokens": 8192,
+        # Free tier needs no sign-in. kilo-auto/efficient|balanced|frontier
+        # need a Kilo account (401 PAID_MODEL_AUTH_REQUIRED without one).
         "models": [
-            "kilo-auto/free",
-            "kilo-auto/efficient",
-            "kilo-auto/balanced",
-            "kilo-auto/frontier",
+            "nvidia/nemotron-3-super-120b-a12b:free",
             "stepfun/step-3.7-flash:free",
-            "inclusionai/ling-3.0-flash:free",
-            "poolside/laguna-s-2.1:free",
-            "cohere/north-mini-code:free",
             "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "inclusionai/ling-3.0-flash-sante:free",
+            "poolside/laguna-s-2.1:free",
+            "kilo-auto/free",
+            "cohere/north-mini-code:free",
         ],
         "tag": "kilo-free",
         "anonymous": True,  # blank key works — public gateway
-        "kilo_headers": True,  # needs the Kilo Code extension referer headers
+        "app_attribution": True,  # OpenRouter-style HTTP-Referer / X-Title for this app
     },
 }
+# Auto mode walks this order; a pinned provider is tried first, then the rest.
+# Keyed providers lead (fast, strong, and skipped instantly without a key),
+# then Kilo's keyless free tier, then opencode's, which answered 1 of 14 free
+# models on 2026-10-07. Curated `models` are the fallback when /models cannot
+# be reached, and the names shown first when they are still live.
+LLM_PROVIDER_ORDER = ["groq", "gemini-free", "nvidia-build", "kilo-free", "opencode-free"]
+_MODELS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_MODELS_TTL = 600
 
 TICKERS = [
     "AAPL", "MSFT", "GOOG", "TSLA", "AMZN", "META", "NFLX", "NVDA", "PYPL", "INTC",
@@ -198,7 +229,7 @@ def resolve_tickers(text: str) -> list[str]:
     """Return EVERY ticker mentioned in the text. Known symbols match as an
     exact substring (longest first); company/asset aliases from COMPANY_NAMES
     match as whole words (so "oil" never matches "boil"). Unknown symbols
-    (e.g. AMD) are left unresolved here — the router may still use them."""
+    (e.g. AMD) are left unresolved here — the agent may still use them."""
     upper = text.upper()
     found = []
     for t in sorted(TICKERS, key=len, reverse=True):
@@ -213,6 +244,60 @@ def resolve_tickers(text: str) -> list[str]:
                 found.append(t)
                 break
     return found
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def normalize_ticker(raw: str) -> str:
+    """Turn whatever the agent wrote ("Tata Motors", "TATAMOTORS", "AMD") into
+    a yfinance symbol. The hardcoded list only knows a handful of Indian names,
+    so anything else goes through Yahoo's search. A bare Indian symbol has no
+    US listing, so the search prefers the NSE line (.NS), then BSE (.BO)."""
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    up = t.upper()
+    # Already yfinance-shaped: RELIANCE.NS, ^NSEI, GC=F, BTC-USD, INR=X
+    if up in TICKERS or re.search(r"[.=^-]", up):
+        return up
+    hits = resolve_tickers(t)
+    if hits:
+        return hits[0]
+    try:
+        quotes = yf.Search(t, max_results=8).quotes or []
+    except Exception:
+        return up
+    syms = [q.get("symbol", "") for q in quotes
+            if q.get("quoteType") in ("EQUITY", "ETF", "INDEX") and q.get("symbol")]
+    if not syms:
+        return up
+    if up in syms:
+        return up
+    for suffix in (".NS", ".BO"):
+        for s in syms:
+            if s.endswith(suffix):
+                return s
+    return syms[0]
+
+
+def market_of(ticker: str) -> str:
+    """Which cost table and benchmark apply to this symbol."""
+    t = ticker.upper()
+    if t.endswith((".NS", ".BO")) or t in ("^NSEI", "^NSEBANK", "^BSESN"):
+        return "india"
+    if t.endswith("-USD"):
+        return "crypto"
+    if t.endswith(("=F", "=X")):
+        return "other"
+    return "us"
+
+
+def benchmark_for(ticker: str) -> str | None:
+    """The index a stock is judged against. None for indices themselves and
+    for futures/FX, where 'beat the market' has no obvious meaning."""
+    t = ticker.upper()
+    if t.startswith("^") or t == "BTC-USD":
+        return None
+    return {"india": "^NSEI", "us": "^GSPC", "crypto": "BTC-USD"}.get(market_of(t))
 
 
 def news_relevant(ticker: str, headline: str, summary: str = "") -> bool:
@@ -249,119 +334,308 @@ def get_key(env_name: str) -> str:
     return key
 
 
+def _key_for(cfg: dict) -> str:
+    """The provider's key if one is configured. Keyless providers still use a
+    key when present (official, higher limits) and go anonymous otherwise."""
+    return get_key(cfg["key_env"]) or ""
+
+
+APP_REFERER = "https://github.com/bravo2024/agenticresearch"
+APP_TITLE = "Agentic Market Research Assistant"
+
+
 def _provider_headers(cfg: dict, key: str) -> dict:
-    """Request headers for a provider; kilo-free (public gateway) needs the
-    referer headers the Kilo Code extension sends."""
+    """Request headers for a provider. OpenRouter-style gateways (Kilo) get
+    the standard attribution headers naming this app."""
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    if cfg.get("kilo_headers"):
-        headers.update({"HTTP-Referer": "https://kilo.ai/", "X-Title": "Kilo Code"})
+    if cfg.get("app_attribution"):
+        headers.update({"HTTP-Referer": APP_REFERER, "X-Title": APP_TITLE})
     return headers
 
 
-def llm_chat(messages: list[dict], temperature: float = 0.2,
-             max_tokens: int = 0, max_retries: int = 3,
-             provider: str = "opencode-free", model: str = "") -> dict:
-    """Call the selected provider; on failure, fall back across providers."""
-    order = []
-    prov_cfg = LLM_PROVIDERS.get(provider)
-    if prov_cfg:
-        models = [model] if model and model in prov_cfg["models"] else prov_cfg["models"]
-        order.append((provider, prov_cfg, models))
-    seen = {provider}
-    for pname in ["opencode-free", "nvidia-build", "groq", "kilo-free"]:
-        if pname in seen or pname not in LLM_PROVIDERS:
-            continue
-        seen.add(pname)
-        order.append((pname, LLM_PROVIDERS[pname], LLM_PROVIDERS[pname]["models"]))
+def discover_models(provider: str, timeout: int = 10) -> list[str]:
+    """Model ids from a provider's OpenAI-compatible /models endpoint.
 
+    Cached for 10 minutes. Returns [] when the provider is unknown, the
+    endpoint is down, or a keyed provider has no key. A miss is not cached,
+    so the next sidebar load tries again.
+    """
+    cfg = LLM_PROVIDERS.get(provider)
+    if not cfg:
+        return []
+    now = time.time()
+    hit = _MODELS_CACHE.get(provider)
+    if hit and now - hit[0] < _MODELS_TTL:
+        return hit[1]
+    key = _key_for(cfg)
+    if not cfg.get("anonymous") and not key:
+        return []
+    ids: list[str] = []
+    try:
+        r = requests.get(
+            f"{cfg['base'].rstrip('/')}/models",
+            headers=_provider_headers(cfg, key),
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        ids = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+        # Gemini's OpenAI-compatible list says "models/gemini-2.5-flash";
+        # chat/completions wants the bare id.
+        ids = [i[len("models/"):] if i.startswith("models/") else i for i in ids]
+    except Exception:
+        ids = []
+    if ids:
+        _MODELS_CACHE[provider] = (now, ids)
+    return ids
+
+
+# Providers advertise far more than chat models, and the strongest ones are
+# not listed first. Discovered ids are ranked by these patterns (earlier =
+# tried first); anything matching MODEL_SKIP is not a chat model at all.
+MODEL_RANK = {
+    "opencode-free": [r"deepseek", r"kimi", r"glm", r"nemotron", r"qwen", r"minimax", r"free"],
+    "groq": [r"gpt-oss-120b", r"kimi-k", r"llama-3\.3-70b", r"qwen", r"gpt-oss-20b", r"llama-3\.1-8b"],
+    # Free-tier text models only: Flash first, then Flash-Lite. No Pro, and
+    # nothing marked preview/exp, image, audio, live or TTS.
+    "gemini-free": [r"^gemini-\d+(\.\d+)?-flash$", r"^gemini-\d+(\.\d+)?-flash-lite$"],
+    # Nemotron-3 answers in ~1s on the free endpoints; DeepSeek / Kimi are
+    # strong but often queue past 60s there (2026-10-07), so they come after.
+    "nvidia-build": [r"nemotron-3-ultra", r"nemotron-3-super", r"deepseek-v4", r"kimi-k3",
+                     r"qwen3", r"llama-3\.3-70b"],
+    "kilo-free": [r"nemotron-3-super", r"step-3", r"nemotron-3-ultra", r"ling-3", r"laguna-s",
+                  r"dots-3", r"kilo-auto/free", r"north", r"openrouter/free"],
+}
+MODEL_SKIP = re.compile(
+    r"embed|guard|safety|safeguard|retriever|reward|vlm|vision|omni|ocr|whisper|tts|clip|"
+    r"parse|orpheus|allam|audio|image|coder-6|codellama|llama2|lfm-2|nano", re.I)
+MODELS_PER_PROVIDER = 5          # failover tries at most this many per provider
+
+# (provider, model) -> epoch seconds until it may be tried again.
+# (provider, "*") blocks the whole provider (bad key).
+_MODEL_HOLD: dict[tuple[str, str], float] = {}
+_PERMANENT_HTTP = {400, 401, 402, 403, 404, 410, 422}
+_HOLD_PERMANENT_S = 1800
+_HOLD_TRANSIENT_S = 60
+_HOLD_SLOW_S = 600               # a model that timed out is queueing; give it 10 minutes
+TIMEOUT = "timeout"
+
+
+def _hold(pname: str, model: str, status) -> None:
+    """Remember a failure so the next call skips this model for a while."""
+    cfg = LLM_PROVIDERS.get(pname, {})
+    if status in _PERMANENT_HTTP:
+        hold = _HOLD_PERMANENT_S
+    elif status == TIMEOUT:
+        hold = _HOLD_SLOW_S
+    else:
+        hold = _HOLD_TRANSIENT_S
+    _MODEL_HOLD[(pname, model)] = time.time() + hold
+    if status == 401 and not cfg.get("anonymous"):
+        _MODEL_HOLD[(pname, "*")] = time.time() + _HOLD_PERMANENT_S
+
+
+# Providers where only MODEL_RANK matches may ever be called, even if pinned
+# from the sidebar: this is what keeps Gemini on free-tier models.
+FREE_TIER_LOCKED = {"gemini-free"}
+
+
+def _allowed(pname: str, model: str) -> bool:
+    if pname not in FREE_TIER_LOCKED:
+        return True
+    return any(re.search(p, model, re.I) for p in MODEL_RANK.get(pname, []))
+
+
+def _usable(pname: str, model: str) -> bool:
+    now = time.time()
+    return _MODEL_HOLD.get((pname, "*"), 0) < now and _MODEL_HOLD.get((pname, model), 0) < now
+
+
+def _rank_models(pname: str, ids: list[str]) -> list[str]:
+    cfg = LLM_PROVIDERS.get(pname, {})
+    ids = [i for i in ids if not MODEL_SKIP.search(i)]
+    if cfg.get("anonymous"):
+        ids = [i for i in ids if "free" in i.lower()]
+    ranked, seen = [], set()
+    for pat in MODEL_RANK.get(pname, []):
+        rx = re.compile(pat, re.I)
+        for i in ids:
+            if i not in seen and rx.search(i):
+                ranked.append(i)
+                seen.add(i)
+    return ranked
+
+
+def available_models(provider: str, free_only: bool = True) -> list[str]:
+    """Live models for the picker: curated ids that are still advertised,
+    then the rest of the live list ranked strongest-first. Falls back to the
+    curated list when discovery fails."""
+    cfg = LLM_PROVIDERS.get(provider, {})
+    static = list(cfg.get("models", []))
+    discovered = discover_models(provider)
+    if not discovered:
+        return static
+    curated = [m for m in static if m in discovered and _allowed(provider, m)]
+    ranked = _rank_models(provider, discovered)
+    if free_only:
+        ranked = [m for m in ranked if "free" in m.lower()] or ranked
+    # Only ranked models are offered: providers advertise dozens of ids that
+    # 404 or are not chat models (NVIDIA lists 80, a handful answer).
+    rest = [m for m in ranked if m not in curated]
+    return (curated + rest) or static
+
+
+def provider_status() -> list[dict]:
+    """One row per provider for the sidebar: key state and live model count."""
+    rows = []
+    for pname in LLM_PROVIDER_ORDER:
+        cfg = LLM_PROVIDERS[pname]
+        if cfg.get("anonymous"):
+            key_state = "keyless"
+        else:
+            key_state = "key set" if get_key(cfg["key_env"]) else f"no key ({cfg['key_env']})"
+        if key_state.startswith("no key") or not _usable(pname, "*"):
+            live = []
+        else:
+            live = [m for m in available_models(pname) if _usable(pname, m)]
+        rows.append({"provider": pname, "key": key_state, "live_models": len(live),
+                     "first": live[0] if live else None})
+    return rows
+
+
+def _models_for(pname: str) -> list[str]:
+    """Models the failover walks for one provider, without a network call:
+    the ranked live list when discovery is cached, else the curated list."""
+    cfg = LLM_PROVIDERS[pname]
+    hit = _MODELS_CACHE.get(pname)
+    if hit and time.time() - hit[0] < _MODELS_TTL:
+        live = set(hit[1])
+        models = [m for m in cfg["models"] if m in live]
+        models += [m for m in _rank_models(pname, hit[1]) if m not in models]
+    else:
+        models = list(cfg["models"])
+    return models
+
+
+def _call_order(provider: str, model: str) -> list[tuple]:
+    """Providers to try, pinned one first. A discovered model id is tried
+    first on its provider even when it is not in the static list. Models
+    recently seen failing are skipped, and each provider contributes at most
+    MODELS_PER_PROVIDER, so one dead endpoint cannot stall an answer."""
+    order = list(LLM_PROVIDER_ORDER)
+    if provider in order:
+        order.remove(provider)
+        order.insert(0, provider)
+    out = []
+    for pname in order:
+        cfg = LLM_PROVIDERS[pname]
+        models = [m for m in _models_for(pname) if _usable(pname, m) and _allowed(pname, m)]
+        if pname == provider and model and _allowed(pname, model):
+            if model in models:
+                models.remove(model)
+            models.insert(0, model)
+        out.append((pname, cfg, models[:MODELS_PER_PROVIDER]))
+    return out
+
+
+def warm_model_registry() -> None:
+    """Fetch every provider's /models in parallel so the first answer already
+    walks live, ranked models instead of the built-in fallback lists."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(LLM_PROVIDER_ORDER)) as ex:
+        list(ex.map(discover_models, LLM_PROVIDER_ORDER))
+
+
+def _post_chat(cfg: dict, key: str, payload: dict, stream: bool = False, timeout=(10, 45)):
+    return requests.post(
+        f"{cfg['base']}/chat/completions",
+        headers=_provider_headers(cfg, key),
+        json=payload, timeout=timeout, stream=stream,
+    )
+
+
+def llm_chat(messages: list[dict], temperature: float = 0.2,
+             max_tokens: int = 0, max_retries: int = 2,
+             provider: str = "", model: str = "") -> dict:
+    """Call the selected provider; on failure, fall back across providers.
+
+    Permanent errors (bad model id, no access, gone) move straight to the next
+    model and park this one for 30 minutes. Rate limits and server errors get
+    one more try, then a 60-second hold."""
     errors = []
-    for pname, cfg, models in order:
-        key = "" if cfg.get("anonymous") else get_key(cfg["key_env"])
+    for pname, cfg, models in _call_order(provider, model):
+        key = _key_for(cfg)
         if not cfg.get("anonymous") and not key:
             errors.append(f"{pname}: no key")
             continue
         mt = max_tokens if max_tokens > 0 else cfg.get("max_tokens", 4096)
+        payload = {"messages": messages, "max_tokens": mt, "temperature": temperature}
         for m in models:
-            for _ in range(max_retries):
+            if not _usable(pname, m):
+                continue
+            for attempt in range(max_retries):
+                status = None
                 try:
-                    r = requests.post(
-                        f"{cfg['base']}/chat/completions",
-                        headers=_provider_headers(cfg, key),
-                        json={
-                            "model": m,
-                            "messages": messages,
-                            "max_tokens": mt,
-                            "temperature": temperature,
-                        },
-                        timeout=60,
-                    )
-                    if r.status_code == 200:
+                    r = _post_chat(cfg, key, {**payload, "model": m})
+                    status = r.status_code
+                    if status == 200:
                         data = r.json()
-                        content = data["choices"][0]["message"].get("content") or ""
-                        if not content.strip():
-                            errors.append(f"{pname}/{m}: empty content")
-                            continue
-                        return {
-                            "ok": True,
-                            "provider": pname,
-                            "model": m,
-                            "text": content,
-                            "tokens": data.get("usage", {}).get("total_tokens", 0),
-                        }
-                    errors.append(f"{pname}/{m}: HTTP {r.status_code}")
+                        choices = data.get("choices") or []
+                        content = (choices[0].get("message") or {}).get("content") if choices else ""
+                        if content and content.strip():
+                            return {
+                                "ok": True,
+                                "provider": pname,
+                                "model": m,
+                                "text": content,
+                                "tokens": (data.get("usage") or {}).get("total_tokens", 0),
+                            }
+                        errors.append(f"{pname}/{m}: empty reply")
+                        _hold(pname, m, None)
+                        break
+                    errors.append(f"{pname}/{m}: HTTP {status}")
+                except requests.Timeout:
+                    status = TIMEOUT
+                    errors.append(f"{pname}/{m}: timed out")
                 except Exception as e:
                     errors.append(f"{pname}/{m}: {str(e)[:60]}")
-            time.sleep(1)
+                if status in _PERMANENT_HTTP or status == TIMEOUT or attempt == max_retries - 1:
+                    _hold(pname, m, status)
+                    break
+                time.sleep(1.5)
+            if not _usable(pname, "*"):
+                break                      # bad key: skip the rest of this provider
 
     return {"ok": False, "error": "; ".join(errors[-8:])}
 
 
 def llm_chat_stream(messages: list[dict], temperature: float = 0.2,
                     max_tokens: int = 0,
-                    provider: str = "opencode-free", model: str = ""):
+                    provider: str = "", model: str = ""):
     """Generator: stream a completion from the provider fallback chain.
 
     Yields text chunks as they arrive (OpenAI-compatible SSE). If the chosen
     provider/model fails or returns empty, silently advances to the next in
-    the chain. Records the winning provider/model in session_state so the
-    caller can display it.
+    the chain, with the same failure memory as llm_chat. Records the winning
+    provider/model in session_state so the caller can display it.
     """
-    order = []
-    prov_cfg = LLM_PROVIDERS.get(provider)
-    if prov_cfg:
-        models = [model] if model and model in prov_cfg["models"] else prov_cfg["models"]
-        order.append((provider, prov_cfg, models))
-    seen = {provider}
-    for pname in ["opencode-free", "nvidia-build", "groq", "kilo-free"]:
-        if pname in seen or pname not in LLM_PROVIDERS:
-            continue
-        seen.add(pname)
-        order.append((pname, LLM_PROVIDERS[pname], LLM_PROVIDERS[pname]["models"]))
-
     errors = []
-    for pname, cfg, models in order:
-        key = "" if cfg.get("anonymous") else get_key(cfg["key_env"])
+    for pname, cfg, models in _call_order(provider, model):
+        key = _key_for(cfg)
         if not cfg.get("anonymous") and not key:
             errors.append(f"{pname}: no key")
             continue
         mt = max_tokens if max_tokens > 0 else cfg.get("max_tokens", 4096)
         for m in models:
+            if not _usable(pname, m):
+                continue
             try:
-                r = requests.post(
-                    f"{cfg['base']}/chat/completions",
-                    headers=_provider_headers(cfg, key),
-                    json={
-                        "model": m,
-                        "messages": messages,
-                        "max_tokens": mt,
-                        "temperature": temperature,
-                        "stream": True,
-                    },
-                    timeout=120,
-                    stream=True,
-                )
+                r = _post_chat(cfg, key, {
+                    "model": m, "messages": messages, "max_tokens": mt,
+                    "temperature": temperature, "stream": True,
+                }, stream=True, timeout=120)
                 if r.status_code != 200:
                     errors.append(f"{pname}/{m}: HTTP {r.status_code}")
+                    _hold(pname, m, r.status_code)
                     continue
                 chunks = []
                 for raw_line in r.iter_lines():
@@ -382,15 +656,18 @@ def llm_chat_stream(messages: list[dict], temperature: float = 0.2,
                             yield piece
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
-                text = "".join(chunks)
-                if text.strip():
+                if "".join(chunks).strip():
                     st.session_state["_llm_provider"] = pname
                     st.session_state["_llm_model"] = m
                     return
                 errors.append(f"{pname}/{m}: empty stream")
+                _hold(pname, m, None)
+            except requests.Timeout:
+                errors.append(f"{pname}/{m}: timed out")
+                _hold(pname, m, TIMEOUT)
             except Exception as e:
                 errors.append(f"{pname}/{m}: {str(e)[:60]}")
-            time.sleep(1)
+                _hold(pname, m, None)
 
     yield f"\n\n_LLM unavailable: {'; '.join(errors[-4:])}_"
 
@@ -407,6 +684,10 @@ def get_history(ticker: str, interval: str = "1d", period: str = "2y") -> pd.Dat
     df = yf.Ticker(ticker).history(period=period, interval=interval)
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
+    # NSE sometimes ships today's row with no close yet; one NaN at the end
+    # turns every "last value" downstream into NaN.
+    if "Close" in df:
+        df = df.dropna(subset=["Close"])
     return df
 
 
@@ -563,16 +844,24 @@ def risk_metrics(ticker: str) -> dict:
     }
 
 
+def rsi_series(close: pd.Series, n: int = 14) -> pd.Series:
+    """Wilder's RSI. Shared by technical_facts, indicators and backtest_rule so
+    all three report the same number."""
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rsi = 100 - 100 / (1 + gain / loss.where(loss > 0))
+    rsi = rsi.where(loss > 0, 100.0).where(gain > 0, 0.0)
+    rsi.iloc[:n] = np.nan                  # not enough bars yet; don't let day 1 read as "0"
+    return rsi
+
+
 def technical_facts(ticker: str) -> dict:
     df = get_history(ticker, "1d", "6mo")
     if df.empty or len(df) < 30:
         return {"error": "not enough data"}
     close = df["Close"]
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rsi = 100 - 100 / (1 + gain / loss.where(loss > 0))
-    rsi = rsi.where(loss > 0, 100.0).where(gain > 0, 0.0)
+    rsi = rsi_series(close)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
@@ -643,6 +932,606 @@ def forecast_range(ticker: str, horizon_days: int = 7) -> dict:
     }
 
 
+def indicators(ticker: str, kind: str = "all") -> dict:
+    """Leading, lagging and volatility readings in one place, plus relative
+    strength against the market's index.
+
+    Lagging indicators confirm a trend after it has started (moving averages,
+    MACD). Leading ones are momentum oscillators that can turn before price
+    does (RSI, stochastic, rate of change, OBV) — and they give more false
+    signals for exactly that reason. Neither says anything about whether a
+    signal has paid in the past; that is backtest_rule's job."""
+    df = get_history(ticker, "1d", "2y")
+    if df.empty or len(df) < 60:
+        return {"ticker": ticker, "error": "not enough daily history"}
+    close, high, low = df["Close"], df["High"], df["Low"]
+    volume = df["Volume"] if "Volume" in df else None
+    last = float(close.iloc[-1])
+    out = {"ticker": ticker, "price": round(last, 2), "as_of": str(df.index[-1].date())}
+    kind = (kind or "all").lower()
+
+    if kind in ("all", "lagging"):
+        sma50 = close.rolling(50).mean()
+        sma200 = close.rolling(200).mean()
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        lag = {
+            "sma50": round(float(sma50.iloc[-1]), 2),
+            "price_vs_sma50_pct": round((last / sma50.iloc[-1] - 1) * 100, 2),
+            "macd": round(float(macd.iloc[-1]), 3),
+            "macd_signal": round(float(signal.iloc[-1]), 3),
+            "macd_state": "above signal" if macd.iloc[-1] > signal.iloc[-1] else "below signal",
+        }
+        if sma200.notna().iloc[-1]:
+            above = sma50 > sma200
+            flips = above.ne(above.shift()) & sma200.notna()
+            lag["sma200"] = round(float(sma200.iloc[-1]), 2)
+            lag["price_vs_sma200_pct"] = round((last / sma200.iloc[-1] - 1) * 100, 2)
+            lag["sma50_vs_sma200"] = "golden cross (50 above 200)" if above.iloc[-1] else "death cross (50 below 200)"
+            if flips.any():
+                lag["days_since_last_cross"] = int((df.index[-1] - flips[flips].index[-1]).days)
+        out["lagging"] = lag
+
+    if kind in ("all", "leading"):
+        rsi = rsi_series(close)
+        lo14, hi14 = low.rolling(14).min(), high.rolling(14).max()
+        stoch_k = 100 * (close - lo14) / (hi14 - lo14)
+        r = float(rsi.iloc[-1])
+        lead = {
+            "rsi14": round(r, 1),
+            "rsi_zone": "oversold (<30)" if r < 30 else "overbought (>70)" if r > 70 else "neutral",
+            "stochastic_k14": round(float(stoch_k.iloc[-1]), 1),
+            "stochastic_d3": round(float(stoch_k.rolling(3).mean().iloc[-1]), 1),
+            "roc_20d_pct": round(float(last / close.iloc[-21] - 1) * 100, 2),
+        }
+        if volume is not None and volume.iloc[-60:].sum() > 0:
+            # OBV divergence: volume flow and price disagreeing over the last
+            # 20 sessions is the classic early warning that a move is thin.
+            obv = (np.sign(close.diff()).fillna(0) * volume).cumsum()
+            obv_up = obv.iloc[-1] > obv.iloc[-21]
+            px_up = close.iloc[-1] > close.iloc[-21]
+            lead["obv_20d"] = "rising" if obv_up else "falling"
+            lead["obv_price_divergence"] = (
+                "none" if obv_up == px_up
+                else "bearish (price up, volume flow down)" if px_up
+                else "bullish (price down, volume flow up)")
+        out["leading"] = lead
+
+    if kind in ("all", "volatility"):
+        prev = close.shift()
+        tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+        mid, sd = close.rolling(20).mean(), close.rolling(20).std()
+        bbw = (4 * sd / mid * 100).dropna()
+        out["volatility"] = {
+            "atr14": round(float(atr.iloc[-1]), 2),
+            "atr_pct_of_price": round(float(atr.iloc[-1] / last * 100), 2),
+            "bollinger_width_pct": round(float(bbw.iloc[-1]), 2),
+            # Where today's band width sits in the last year: a low percentile
+            # is a squeeze, which tends to come before a bigger move.
+            "bollinger_width_percentile_1y": round(float((bbw.iloc[-252:] <= bbw.iloc[-1]).mean() * 100), 0),
+            "realised_vol_20d_annual_pct": round(float(close.pct_change().iloc[-20:].std() * np.sqrt(252) * 100), 1),
+        }
+
+    bench = benchmark_for(ticker)
+    if bench and kind in ("all", "relative"):
+        b = get_history(bench, "1d", "2y")
+        if not b.empty:
+            both = pd.concat({"s": close, "b": b["Close"]}, axis=1).dropna()
+            rs = {"benchmark": bench}
+            for label, n in (("1m", 21), ("3m", 63), ("6m", 126)):
+                if len(both) > n:
+                    s_ret = both["s"].iloc[-1] / both["s"].iloc[-n - 1] - 1
+                    b_ret = both["b"].iloc[-1] / both["b"].iloc[-n - 1] - 1
+                    rs[f"excess_return_{label}_pct"] = round((s_ret - b_ret) * 100, 2)
+            out["relative_strength"] = rs
+    return out
+
+
+# Cost per side as a fraction of trade value, slippage included. India
+# delivery: STT 0.1% on buy and on sell, stamp duty 0.015% on the buy,
+# exchange + SEBI + GST a few thousandths of a percent, plus ~0.03% slippage
+# (zero-brokerage broker assumed). The budget changes STT now and then, so
+# these are defaults, not a quote.
+TRADE_COSTS = {"india": 0.0015, "us": 0.0005, "crypto": 0.0010, "other": 0.0005}
+# 1m is about 7 days on Yahoo, 5m and 15m about 60. The horizon is the cone
+# ahead: 30 minutes, one hour, two hours. The cost is a spread per side.
+# Delivery STT on every one-minute flip is not what an intraday bar pays.
+INTRADAY_INTERVALS = ("1m", "5m", "15m")
+INTRADAY_PERIOD = {"1m": "7d", "5m": "60d", "15m": "60d"}
+INTRADAY_HORIZON_BARS = {"1m": 30, "5m": 12, "15m": 8}
+INTRADAY_COSTS = {"india": 0.0002, "us": 0.0001, "crypto": 0.0005, "other": 0.0002}
+
+BACKTEST_RULES = {
+    "rsi_oversold": "buy when RSI(14) < entry (30), sell when RSI > exit (50)",
+    "ma_cross": "hold while SMA(fast=50) is above SMA(slow=200)",
+    "breakout": "buy on a close above the prior entry-day high (55), sell on a close below the prior exit-day low (20)",
+    "macd_cross": "hold while MACD is above its signal line",
+}
+
+
+def _rule_positions(df: pd.DataFrame, rule: str, p: dict) -> pd.Series:
+    """1 on days the rule wants to be long at the close, else 0."""
+    close = df["Close"]
+    if rule == "rsi_oversold":
+        rsi = rsi_series(close)
+        entry, exit_ = float(p.get("entry", 30)), float(p.get("exit", 50))
+        pos, held = [], 0
+        for v in rsi.to_numpy():
+            if not held and v < entry:
+                held = 1
+            elif held and v > exit_:
+                held = 0
+            pos.append(held)
+        return pd.Series(pos, index=close.index)
+    if rule == "ma_cross":
+        fast = close.rolling(int(p.get("fast", 50))).mean()
+        slow = close.rolling(int(p.get("slow", 200))).mean()
+        return (fast > slow).astype(int)
+    if rule == "breakout":
+        hi = df["High"].rolling(int(p.get("entry", 55))).max().shift()
+        lo = df["Low"].rolling(int(p.get("exit", 20))).min().shift()
+        pos, held = [], 0
+        for c, h, l in zip(close.to_numpy(), hi.to_numpy(), lo.to_numpy()):
+            if not held and c > h:
+                held = 1
+            elif held and c < l:
+                held = 0
+            pos.append(held)
+        return pd.Series(pos, index=close.index)
+    if rule == "macd_cross":
+        macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        return (macd > macd.ewm(span=9, adjust=False).mean()).astype(int)
+    raise ValueError(f"unknown rule {rule}; choose from {list(BACKTEST_RULES)}")
+
+
+def _segment_stats(close: pd.Series, held: pd.Series, cost: float,
+                   bench: pd.Series | None) -> dict:
+    """Trade list and summary for one slice of history."""
+    ret = close.pct_change().fillna(0)
+    sides = held.diff().abs().fillna(held.iloc[0])
+    equity = (1 + held * ret - sides * cost).cumprod()
+    trades = []
+    block = (held != held.shift()).cumsum()
+    for _, days in held[held == 1].groupby(block[held == 1]):
+        i0 = close.index.get_loc(days.index[0])
+        entry = close.iloc[max(i0 - 1, 0)]
+        exit_ = close.loc[days.index[-1]]
+        trades.append(float(exit_ / entry - 1 - 2 * cost))
+    wins = [t for t in trades if t > 0]
+    losses = [t for t in trades if t <= 0]
+    stats = {
+        "from": str(close.index[0].date()),
+        "to": str(close.index[-1].date()),
+        "strategy_return_pct": round((equity.iloc[-1] - 1) * 100, 2),
+        "buy_and_hold_pct": round((close.iloc[-1] / close.iloc[0] - 1) * 100, 2),
+        "trades": len(trades),
+        "win_rate_pct": round(len(wins) / len(trades) * 100, 1) if trades else None,
+        "avg_win_pct": round(np.mean(wins) * 100, 2) if wins else None,
+        "avg_loss_pct": round(np.mean(losses) * 100, 2) if losses else None,
+        "profit_factor": round(sum(wins) / -sum(losses), 2) if wins and losses and sum(losses) < 0 else None,
+        "max_drawdown_pct": round(float((equity / equity.cummax() - 1).min() * 100), 2),
+        "time_in_market_pct": round(float(held.mean() * 100), 1),
+    }
+    if bench is not None:
+        b = bench.reindex(close.index).dropna()
+        if len(b) > 1:
+            stats["index_return_pct"] = round((b.iloc[-1] / b.iloc[0] - 1) * 100, 2)
+    return stats
+
+
+def backtest_rule(ticker: str, rule: str = "rsi_oversold", params: dict | None = None,
+                  years: int = 5, cost_per_side: float | None = None) -> dict:
+    """Has this setup actually paid on this stock? Long-only, daily bars,
+    with costs, judged separately on the first 70% of history (where you'd
+    have found the idea) and the last 30% (which the rule never saw).
+
+    The signal is read at a day's close and the trade is assumed filled at
+    that same close — optimistic by a few ticks, which the slippage in the
+    cost table is meant to cover."""
+    params = params or {}
+    df = get_history(ticker, "1d", f"{int(years)}y")
+    if df.empty or len(df) < 300:
+        return {"ticker": ticker, "error": "need at least ~300 daily bars to split in/out of sample"}
+    try:
+        pos = _rule_positions(df, rule, params)
+    except ValueError as e:
+        return {"ticker": ticker, "error": str(e)}
+    held = pos.shift(1).fillna(0)          # today's P&L comes from yesterday's decision
+    market = market_of(ticker)
+    cost = TRADE_COSTS[market] if cost_per_side is None else float(cost_per_side)
+    bench_sym = benchmark_for(ticker)
+    bench = None
+    if bench_sym:
+        b = get_history(bench_sym, "1d", f"{int(years)}y")
+        bench = None if b.empty else b["Close"]
+
+    close = df["Close"]
+    cut = int(len(close) * 0.7)
+    ins = _segment_stats(close.iloc[:cut], held.iloc[:cut], cost, bench)
+    oos = _segment_stats(close.iloc[cut:], held.iloc[cut:], cost, bench)
+
+    if (oos["trades"] or 0) < 5:
+        verdict = "too few trades in the out-of-sample period to judge"
+    elif oos["strategy_return_pct"] > oos["buy_and_hold_pct"] and (oos["profit_factor"] or 0) > 1:
+        verdict = "held up out of sample: beat buy-and-hold after costs"
+    elif ins["strategy_return_pct"] > ins["buy_and_hold_pct"]:
+        verdict = "worked in sample but did not survive out of sample"
+    else:
+        verdict = "no edge after costs: buy-and-hold did better in both periods"
+
+    return {
+        "ticker": ticker,
+        "rule": rule,
+        "rule_description": BACKTEST_RULES.get(rule),
+        "params": params,
+        "market": market,
+        "cost_per_side_pct": round(cost * 100, 3),
+        "benchmark": bench_sym,
+        "in_sample": ins,
+        "out_of_sample": oos,
+        "verdict": verdict,
+        "method": "long-only daily backtest, costs and slippage per side, 70/30 chronological split; past results, not a recommendation",
+    }
+
+
+def _block_bootstrap_mean_ci(values, n_boot: int = 800, alpha: float = 0.05,
+                             seed: int = 0) -> tuple[float, float] | None:
+    """95% (or tighter) interval for the mean, resampling in blocks so a
+    streak of up days counts as one draw. Returns None when the sample is
+    too short to mean anything."""
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    if n < 30:
+        return None
+    block = max(5, int(round(n ** (1.0 / 3.0))))
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block))
+    starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    idx = (starts[..., None] + np.arange(block)) % n
+    means = x[idx].reshape(n_boot, -1)[:, :n].mean(axis=1)
+    lo, hi = np.quantile(means, [alpha / 2.0, 1.0 - alpha / 2.0])
+    return float(lo), float(hi)
+
+
+def _judge_excess(oos: dict, excess: np.ndarray, n_trials: int) -> dict:
+    """Kill a rule that loses to buy-and-hold, has too few trades, or whose
+    daily edge still includes zero after a block bootstrap. Extra rules tried
+    in the same session tighten the interval (Bonferroni)."""
+    n_trials = max(int(n_trials), 1)
+    alpha = 0.05 / n_trials
+    killed = []
+    # Five closes the same gate as the backtest text. A 50/200 cross often
+    # trades only a handful of times in the last 30% of five years; twenty
+    # would reject every trend rule before the return test gets a say.
+    if (oos.get("trades") or 0) < 5:
+        killed.append("too_few_trades")
+    if oos.get("strategy_return_pct", 0) <= oos.get("buy_and_hold_pct", 0):
+        killed.append("lost_to_buy_and_hold")
+    ci = _block_bootstrap_mean_ci(excess, alpha=alpha)
+    if ci is None:
+        killed.append("not_enough_oos_days")
+    elif ci[0] <= 0 <= ci[1]:
+        killed.append("excess_not_significant")
+    mean = float(np.nanmean(excess)) if len(excess) else 0.0
+    std = float(np.nanstd(excess, ddof=1)) if len(excess) > 2 else 0.0
+    t_stat = mean / (std / np.sqrt(len(excess))) if std > 0 and len(excess) > 2 else 0.0
+    return {
+        "killed_by": killed,
+        "alpha": alpha,
+        "ci": ci,
+        "mean": mean,
+        "t_stat": t_stat,
+        "n": int(len(excess)),
+    }
+
+
+def _range_calibration(close: pd.Series, horizon: int = 7, lookback: int = 63,
+                       eval_days: int = 252) -> dict:
+    """How often a band built only from past data contained the later close,
+    and how often the sign of a clear trailing drift matched the later move.
+
+    Rolling mean and volatility, not a fresh GARCH fit each day: one fit per
+    day would take minutes, and this scores the same 1.04 / 1.96 band shape
+    the live cone uses. A day counts as a drift call only when the lookback
+    mean is at least one standard error from zero.
+    """
+    px = close.dropna().astype(float)
+    ret = px.pct_change()
+    horizon = max(int(horizon), 1)
+    rows = []
+    for i in range(lookback, len(px) - horizon):
+        window = ret.iloc[i - lookback + 1:i + 1].dropna()
+        if len(window) < lookback // 2:
+            continue
+        mu, sig = float(window.mean()), float(window.std(ddof=1))
+        if not np.isfinite(sig) or sig <= 0:
+            continue
+        t_stat = mu / (sig / np.sqrt(len(window)))
+        last, fut = float(px.iloc[i]), float(px.iloc[i + horizon])
+        drift, vol = mu * horizon, sig * np.sqrt(horizon)
+        lo70, hi70 = last * (1 + drift - 1.04 * vol), last * (1 + drift + 1.04 * vol)
+        lo95, hi95 = last * (1 + drift - 1.96 * vol), last * (1 + drift + 1.96 * vol)
+        pred = 1 if t_stat > 1 else (-1 if t_stat < -1 else 0)
+        rows.append((lo70 <= fut <= hi70, lo95 <= fut <= hi95, pred, fut > last))
+    if len(rows) > eval_days:
+        rows = rows[-eval_days:]
+    if len(rows) < 40:
+        return {"error": "not enough history to score the bands", "n": len(rows)}
+    hit70, hit95, pred, up = (np.array([r[i] for r in rows]) for i in range(4))
+    called = pred != 0
+    n_called = int(called.sum())
+    correct = np.zeros(len(rows), dtype=bool)
+    correct[called] = ((pred[called] == 1) & up[called]) | ((pred[called] == -1) & ~up[called])
+    hit = float(correct[called].mean()) if n_called else None
+    base = float(up.mean())
+    usable = False
+    if n_called >= 30 and hit is not None:
+        score = np.where(called, correct.astype(float), np.nan)
+        ci = _block_bootstrap_mean_ci(score[called], alpha=0.05, seed=1)
+        usable = bool(ci and ci[0] > base and hit > base)
+    return {
+        "n": int(len(rows)),
+        "horizon_days": horizon,
+        "band70_hit_rate": round(float(hit70.mean()), 3),
+        "band95_hit_rate": round(float(hit95.mean()), 3),
+        "drift_calls": n_called,
+        "drift_sign_hit_rate": round(hit, 3) if hit is not None else None,
+        "up_rate_base": round(base, 3),
+        "drift_usable": usable,
+        "method": "rolling 63-day mean and volatility, last year scored, horizon as given",
+    }
+
+
+def _direction_from_tests(position_long: bool, killed_by: list) -> str:
+    if killed_by:
+        return "no-edge"
+    return "long" if position_long else "flat"
+
+
+def _intraday_cone(close: pd.Series, horizon_bars: int) -> dict:
+    """A short forward band from the last 63 bars. No daily GARCH fit."""
+    px = close.dropna().astype(float)
+    horizon_bars = max(int(horizon_bars), 1)
+    window = px.pct_change().dropna().iloc[-63:]
+    if len(window) < 20:
+        return {"error": "not enough bars for an intraday band"}
+    mu, sig = float(window.mean()), float(window.std(ddof=1))
+    if not np.isfinite(sig) or sig <= 0:
+        return {"error": "intraday volatility is zero"}
+    last = float(px.iloc[-1])
+    drift, vol = mu * horizon_bars, sig * np.sqrt(horizon_bars)
+    return {
+        "center_est": last * (1 + drift),
+        "range_70": [last * (1 + drift - 1.04 * vol), last * (1 + drift + 1.04 * vol)],
+        "range_95": [last * (1 + drift - 1.96 * vol), last * (1 + drift + 1.96 * vol)],
+        "horizon": horizon_bars,
+        "horizon_bars": horizon_bars,
+        "method": "rolling 63-bar mean and volatility",
+    }
+
+
+def compute_verdict_from_frame(df: pd.DataFrame, rule: str, params: dict | None,
+                               cost: float, horizon_days: int, n_trials: int,
+                               benchmark: pd.Series | None = None,
+                               forecast: dict | None = None,
+                               ticker: str = "", interval: str = "1d") -> dict:
+    """Direction from a tested rule, plus whether the forward band has been honest.
+
+    direction is long or flat only when the out-of-sample edge survives costs,
+    a minimum trade count, and a block-bootstrap interval. Otherwise it is
+    no-edge, even if the rule wants to be long today.
+    """
+    params = params or {}
+    if rule not in BACKTEST_RULES:
+        return {"ticker": ticker, "error": f"unknown rule {rule}; choose from {list(BACKTEST_RULES)}"}
+    if df is None or df.empty or len(df) < 300 or "Close" not in df:
+        return {"ticker": ticker, "interval": interval,
+                "error": f"need at least 300 {interval} bars"}
+    try:
+        pos = _rule_positions(df, rule, params)
+    except ValueError as e:
+        return {"ticker": ticker, "error": str(e)}
+    held = pos.shift(1).fillna(0)
+    close = df["Close"].astype(float)
+    ret = close.pct_change().fillna(0)
+    sides = held.diff().abs().fillna(held.iloc[0])
+    strat = held * ret - sides * cost
+    excess = (strat - ret).to_numpy()
+    cut = int(len(close) * 0.7)
+    oos_stats = _segment_stats(close.iloc[cut:], held.iloc[cut:], cost, benchmark)
+    ins_stats = _segment_stats(close.iloc[:cut], held.iloc[:cut], cost, benchmark)
+    judged = _judge_excess(oos_stats, excess[cut:], n_trials)
+    position_long = bool(pos.iloc[-1] == 1)
+    direction = _direction_from_tests(position_long, judged["killed_by"])
+
+    oos_ret = ret.iloc[cut:]
+    oos_held = held.iloc[cut:]
+    long_days = oos_ret[oos_held == 1]
+    flat_days = oos_ret[oos_held == 0]
+    base_up = float((oos_ret > 0).mean()) if len(oos_ret) else 0.0
+    up_when_long = float((long_days > 0).mean()) if len(long_days) else None
+    lift = (up_when_long - base_up) if up_when_long is not None else None
+
+    cal = _range_calibration(close, horizon_days)
+    fc = forecast or {}
+    last = float(close.iloc[-1])
+    center = fc.get("center_est")
+    band95 = fc.get("range_95") or [None, None]
+    upside = downside = None
+    bias = None
+    if center is not None and band95[0] is not None:
+        upside = (band95[1] - last) / last * 100
+        downside = (last - band95[0]) / last * 100
+        if center > last * 1.001:
+            bias = "up"
+        elif center < last * 0.999:
+            bias = "down"
+        else:
+            bias = "flat"
+
+    ci = judged["ci"]
+    excess_bps = judged["mean"] * 1e4
+    intraday = interval in INTRADAY_INTERVALS
+    summary = _verdict_summary(
+        direction, rule, position_long, judged["killed_by"], excess_bps, lift,
+        cal, upside, downside, bias, n_trials,
+        unit="bar" if intraday else "day",
+        window_phrase=f"this {interval} window" if intraday else "the last year",
+    )
+    as_of = close.index[-1]
+    as_of_s = as_of.strftime("%Y-%m-%d %H:%M") if intraday else str(as_of.date())
+    return {
+        "ticker": ticker,
+        "interval": interval,
+        "rule": rule,
+        "rule_description": BACKTEST_RULES[rule],
+        "as_of": as_of_s,
+        "direction": direction,
+        "rule_position": "long" if position_long else "flat",
+        "follow_rule": direction != "no-edge",
+        "killed_by": judged["killed_by"],
+        "trials": int(max(n_trials, 1)),
+        "ci_level": round(1 - judged["alpha"], 4),
+        "oos": {
+            "strategy_return_pct": oos_stats["strategy_return_pct"],
+            "buy_and_hold_pct": oos_stats["buy_and_hold_pct"],
+            "trades": oos_stats["trades"],
+            "excess_mean_bps": round(excess_bps, 2),
+            "t_stat": round(judged["t_stat"], 2),
+            "bootstrap_ci_bps": [round(ci[0] * 1e4, 2), round(ci[1] * 1e4, 2)] if ci else None,
+            "days": judged["n"],
+        },
+        "in_sample_return_pct": ins_stats["strategy_return_pct"],
+        "direction_stats": {
+            "oos_days_long": int(len(long_days)),
+            "mean_return_when_long_bps": round(float(long_days.mean()) * 1e4, 2) if len(long_days) else None,
+            "mean_return_when_flat_bps": round(float(flat_days.mean()) * 1e4, 2) if len(flat_days) else None,
+            "up_rate_when_long": round(up_when_long, 3) if up_when_long is not None else None,
+            "up_rate_base": round(base_up, 3),
+            "lift": round(lift, 3) if lift is not None else None,
+        },
+        "forecast": {
+            "horizon_days": int(horizon_days),
+            "horizon_bars": int((fc or {}).get("horizon_bars") or (horizon_days if intraday else 0)) or None,
+            "center_est": center,
+            "range_70": fc.get("range_70"),
+            "range_95": fc.get("range_95"),
+            "price_bias": bias,
+            "upside_95_pct": round(upside, 2) if upside is not None else None,
+            "downside_95_pct": round(downside, 2) if downside is not None else None,
+            **{k: cal.get(k) for k in (
+                "band70_hit_rate", "band95_hit_rate", "drift_sign_hit_rate",
+                "drift_calls", "drift_usable", "up_rate_base", "method", "error", "n",
+            )},
+        },
+        "summary": summary,
+        "method": (
+            f"{interval} bars, spread {cost * 100:.3f}% per side, out-of-sample excess, "
+            "block-bootstrap interval"
+            if intraday else
+            "daily bars, delivery costs, out-of-sample excess, block-bootstrap interval; "
+            "live cone is GARCH(1,1)-AR(1); band hit rate is a rolling-vol walk-forward"
+        ),
+    }
+
+
+def _verdict_summary(direction, rule, position_long, killed_by, excess_bps, lift,
+                     cal, upside, downside, bias, n_trials,
+                     unit: str = "day", window_phrase: str = "the last year") -> str:
+    position = "long" if position_long else "flat"
+    lift_pp = (lift or 0) * 100
+    band70 = cal.get("band70_hit_rate")
+    if direction == "no-edge":
+        why = ", ".join(killed_by) or "no measured edge"
+        text = (f"No tested direction on {rule}: killed by {why}. "
+                f"The rule is {position} at the last close, and that position is not backed by the out-of-sample test.")
+    else:
+        side = "long" if direction == "long" else "flat, stay out"
+        text = (f"Tested direction: {side}. The {rule} rule is {position} at the last close. "
+                f"Out-of-sample excess over buy-and-hold is {excess_bps:.1f} bps per {unit}. "
+                f"Days in the trade beat the base rate of up days by {lift_pp:.1f} percentage points.")
+    if upside is not None and downside is not None:
+        text += (f" The 95% band leaves {upside:.1f}% of room above the last price and {downside:.1f}% below"
+                 f" (center bias {bias}).")
+    if band70 is not None:
+        text += f" A 70% band built from past data contained the later close on {band70:.0%} of {window_phrase}."
+    if cal.get("drift_usable"):
+        text += " The trailing drift's direction has also held up on that window."
+    elif cal.get("drift_sign_hit_rate") is not None:
+        text += " The trailing drift's direction has not been reliable, so the stance comes from the rule test."
+    if n_trials > 1:
+        text += f" Judged against {n_trials} rules tried in this session."
+    return text
+
+
+def _session_trials(ticker: str, rule: str, interval: str = "1d") -> int:
+    """How many distinct ticker/rule/interval triples verdict has scored.
+    Repeating the same triple does not tighten the bar again."""
+    try:
+        seen = st.session_state.setdefault("_verdict_rules", [])
+        token = f"{ticker}|{rule}|{interval}"
+        if token not in seen:
+            seen.append(token)
+        return len(seen)
+    except Exception:
+        return 1
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _verdict_cached(ticker: str, rule: str, params_json: str, years: int,
+                    horizon_days: int, n_trials: int, interval: str = "1d") -> dict:
+    params = json.loads(params_json) if params_json else {}
+    intraday = interval in INTRADAY_INTERVALS
+    if intraday:
+        df = get_history(ticker, interval, INTRADAY_PERIOD[interval])
+        forecast = _intraday_cone(df["Close"], horizon_days) if not df.empty and "Close" in df else {}
+        if forecast.get("error"):
+            forecast = {}
+        bench = None
+        cost = INTRADAY_COSTS[market_of(ticker)]
+    else:
+        df = get_history(ticker, "1d", f"{int(years)}y")
+        bench_sym = benchmark_for(ticker)
+        bench = None
+        if bench_sym:
+            b = get_history(bench_sym, "1d", f"{int(years)}y")
+            bench = None if b.empty else b["Close"]
+        forecast = forecast_range(ticker, horizon_days)
+        if forecast.get("error"):
+            forecast = {}
+        cost = TRADE_COSTS[market_of(ticker)]
+    return compute_verdict_from_frame(
+        df, rule, params, cost, horizon_days, n_trials,
+        bench, forecast, ticker, interval,
+    )
+
+
+def verdict(ticker: str, rule: str = "rsi_oversold", params: dict | None = None,
+            years: int = 5, horizon_days: int = 7, n_trials: int | None = None,
+            interval: str = "1d") -> dict:
+    """Tested direction for one rule on one symbol. Python computes it.
+
+    interval 1d uses five years and a GARCH cone. 1m, 5m, and 15m use the
+    bars Yahoo actually keeps and a rolling-volatility cone a short way ahead.
+    """
+    if interval not in ("1d",) + INTRADAY_INTERVALS:
+        interval = "1d"
+    if interval in INTRADAY_HORIZON_BARS:
+        horizon_days = INTRADAY_HORIZON_BARS[interval]
+    else:
+        horizon_days = min(max(int(horizon_days), 1), 20)
+    trials = _session_trials(ticker, rule, interval) if n_trials is None else max(int(n_trials), 1)
+    try:
+        return _verdict_cached(ticker, rule, json.dumps(params or {}, sort_keys=True),
+                               int(years), horizon_days, trials, interval)
+    except Exception as e:
+        return {"ticker": ticker, "rule": rule, "interval": interval, "error": str(e)[:200]}
+
+
 # Code-execution subprocess: the LLM writes the analysis, Python runs the real math.
 CODE_INTERPRETER_HEADER = textwrap.dedent("""
     import warnings
@@ -703,10 +1592,14 @@ CODE_INTERPRETER_PROMPT = (
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def pair_correlation(ticker_a: str, ticker_b: str, period: str = "1y") -> dict:
+def pair_correlation(ticker_a: str, ticker_b: str, period: str = "1y", lag: int = 0) -> dict:
     """Deterministic two-ticker link metrics computed in-app with pandas (no
     LLM-written code): aligned-close correlation, both beta directions, and
-    current prices. Never fails the way LLM code can."""
+    current prices. Never fails the way LLM code can.
+
+    lag > 0 adds shifted correlations: does today's move in A line up with
+    B's move 1..lag days later (and the other way round)? That's a hint about
+    who moves first, not proof — a real signal still has to pass backtest_rule."""
     try:
         a = get_history(ticker_a, "1d", period)
         b = get_history(ticker_b, "1d", period)
@@ -726,7 +1619,11 @@ def pair_correlation(ticker_a: str, ticker_b: str, period: str = "1y") -> dict:
     var_a = df["a"].var()
     beta_a_on_b = (df["a"].cov(df["b"]) / var_b) if var_b else None
     beta_b_on_a = (df["b"].cov(df["a"]) / var_a) if var_a else None
-    return {
+    lead_lag = {}
+    for k in range(1, min(int(lag), 10) + 1):
+        lead_lag[f"a_today_vs_b_in_{k}d"] = round(float(df["a"].corr(df["b"].shift(-k))), 3)
+        lead_lag[f"b_today_vs_a_in_{k}d"] = round(float(df["b"].corr(df["a"].shift(-k))), 3)
+    out = {
         "ticker_a": ticker_a,
         "ticker_b": ticker_b,
         "correlation": round(float(corr), 3),
@@ -745,6 +1642,18 @@ def pair_correlation(ticker_a: str, ticker_b: str, period: str = "1y") -> dict:
         },
         "method": "deterministic pandas computation on aligned daily closes (no code interpreter)",
     }
+    if lead_lag:
+        out["lead_lag_correlations"] = lead_lag
+        ma, mb = market_of(ticker_a), market_of(ticker_b)
+        if ma != mb or {ma, mb} & {"other", "crypto"}:   # futures/FX/crypto: near-24h sessions
+            # NSE shuts at 15:30 IST, US futures and FX trade on after that, so
+            # "the same date" is a different moment for each. A 1-day lag
+            # correlation across such pairs is often just that clock gap.
+            out["timing_caveat"] = ("these markets close at different times; a 1-day lag "
+                                    "correlation can come from the closing-time gap rather "
+                                    "than one market leading the other — treat it as a "
+                                    "hypothesis to test, not a signal")
+    return out
 
 
 def data_bundle(ticker: str) -> dict:
@@ -784,6 +1693,12 @@ def data_bundle(ticker: str) -> dict:
         tf = technical_facts(ticker)
         if "error" not in tf:
             bundle["technical_facts"] = tf
+    except Exception:
+        pass
+    try:
+        ind = indicators(ticker)
+        if "error" not in ind:
+            bundle["indicators"] = ind
     except Exception:
         pass
     try:
@@ -843,7 +1758,7 @@ def run_analysis_code(code: str, bundle: dict | None = None, timeout: int = 120)
 
 
 def agent_analysis(question: str, ticker: str,
-                   provider: str = "opencode-free", model: str = "",
+                   provider: str = "", model: str = "",
                    tickers: list[str] | None = None) -> dict:
     """Tool: LLM writes analysis code → subprocess runs it with the FULL data
     bundle injected → real output returned.
@@ -1063,7 +1978,7 @@ def lexicon_score(text: str) -> float:
 
 
 def sentiment_score(ticker: str, lookback_days: int = 7,
-                    provider: str = "opencode-free", model: str = "") -> dict:
+                    provider: str = "", model: str = "") -> dict:
     news = get_ticker_news(ticker, limit=15)
     if not news:
         return {"error": "no recent news"}
@@ -1176,13 +2091,31 @@ SUGGESTED_QUESTIONS = [
     "MSFT technicals: RSI, MACD, Bollinger",
     "BTC-USD: earnings + risk snapshot",
     "NVDA vs AMD: volatility face-off",
+    "Bajaj Finance looks oversold. Has buying RSI dips actually worked on it?",
+    "HDFC Bank: leading vs lagging indicators, and how is it doing against NIFTY?",
+    "Does crude oil lead the Indian rupee? Check a 5-day lag",
 ]
 
 
-def run_tool(name: str, args: dict, provider: str = "opencode-free", model: str = "") -> dict:
-    ticker = args.get("ticker", "").upper().strip()
+def run_tool(name: str, args: dict, provider: str = "", model: str = "") -> dict:
+    ticker = normalize_ticker(str(args.get("ticker", "")))
     if not ticker:
         return {"error": "no ticker"}
+    if name == "indicators":
+        return indicators(ticker, args.get("kind", "all"))
+    if name == "backtest_rule":
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        return backtest_rule(ticker, args.get("rule", "rsi_oversold"), params,
+                             int(args.get("years", 5)))
+    if name == "verdict":
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        raw_trials = args.get("n_trials")
+        return verdict(
+            ticker, args.get("rule") or "rsi_oversold", params,
+            int(args.get("years") or 5), int(args.get("horizon_days") or 7),
+            None if raw_trials in (None, "") else int(raw_trials),
+            str(args.get("interval") or "1d"),
+        )
     if name == "get_quote":
         return get_quote(ticker)
     if name == "get_history":
@@ -1208,10 +2141,15 @@ def run_tool(name: str, args: dict, provider: str = "opencode-free", model: str 
         return agent_analysis(args.get("question", ""), ticker, provider, model,
                               tickers=args.get("tickers") or None)
     if name == "pair_correlation":
-        tb = str(args.get("ticker_b", "")).strip().upper()
+        tb = normalize_ticker(str(args.get("ticker_b", "")))
         if not tb:
             return {"error": "pair_correlation needs both ticker (a) and ticker_b (b)"}
-        return pair_correlation(ticker, tb)
+        return pair_correlation(ticker, tb, str(args.get("period", "1y")),
+                                lag=int(args.get("lag", 0) or 0))
+    if name == "chart_spec":
+        spec_args = dict(args)
+        spec_args["ticker"] = ticker
+        return set_chart_spec(spec_args)
     return {"error": f"unknown tool {name}"}
 
 
@@ -1249,8 +2187,38 @@ AGENT_TOOL_MANIFEST = [
     },
     {
         "name": "pair_correlation",
-        "description": "Deterministic correlation + beta between two tickers (computed in-app with pandas, cannot fail). Use for correlation/beta/co-movement/link questions between two assets instead of run_analysis. Args: ticker = first symbol, ticker_b = second symbol.",
-        "args": {"ticker": "e.g. AAPL", "ticker_b": "e.g. MSFT"},
+        "description": "Deterministic correlation + beta between two tickers (computed in-app with pandas, cannot fail). Use for correlation/beta/co-movement/link questions between two assets instead of run_analysis. Args: ticker = first symbol, ticker_b = second symbol. Set lag (1-10) for 'does A lead B' / 'who moves first' questions: adds correlations of today's move in one with the other's move 1..lag days later.",
+        "args": {"ticker": "e.g. AAPL", "ticker_b": "e.g. MSFT", "lag": 0, "period": "1y (or 2y/5y)"},
+    },
+    {
+        "name": "risk_metrics",
+        "description": "Deterministic 1-year risk snapshot: daily and annual volatility, 1-day historical VaR 95%, max drawdown, Sharpe. Use for risk / VaR / drawdown / volatility questions instead of run_analysis.",
+        "args": {"ticker": "string"},
+    },
+    {
+        "name": "forecast_range",
+        "description": "Volatility-based 70% and 95% price ranges over the next N trading days (GARCH(1,1) on daily returns). A range, never a direction call. Use for outlook / forecast / 'where could it be in a week' questions.",
+        "args": {"ticker": "string", "horizon_days": 5},
+    },
+    {
+        "name": "indicators",
+        "description": "Leading indicators (RSI, stochastic, 20-day rate of change, OBV divergence), lagging indicators (50/200-day moving averages, golden/death cross, MACD), volatility (ATR, Bollinger width and squeeze percentile, realised vol) and relative strength vs the market index (NIFTY 50 for Indian stocks, S&P 500 for US). kind: all/leading/lagging/volatility/relative.",
+        "args": {"ticker": "e.g. TATAMOTORS.NS", "kind": "all"},
+    },
+    {
+        "name": "backtest_rule",
+        "description": "Test whether a trading setup has actually paid on this ticker: long-only daily backtest with realistic costs (Indian STT/stamp duty for NSE/BSE), split into in-sample (first 70%) and out-of-sample (last 30%), compared with buy-and-hold and the index. Use for 'is this a good entry', 'should I buy', 'does RSI/MA/breakout work on X' questions. rule: rsi_oversold (params entry, exit), ma_cross (fast, slow), breakout (entry, exit lookback days), macd_cross.",
+        "args": {"ticker": "string", "rule": "rsi_oversold", "params": {"entry": 30, "exit": 50}, "years": 5},
+    },
+    {
+        "name": "verdict",
+        "description": "Tested direction for one rule: long, flat, or no-edge. interval is 1d (five years, GARCH cone), or 1m, 5m, 15m (the bars Yahoo keeps, a short rolling-vol cone). Call this for buy, sell, hold, outlook, or 'which way' questions, including intraday. Quote direction and summary. Do not invent a different direction. rule: rsi_oversold, ma_cross, breakout, macd_cross.",
+        "args": {"ticker": "string", "rule": "rsi_oversold", "interval": "1d", "years": 5, "horizon_days": 7},
+    },
+    {
+        "name": "chart_spec",
+        "description": "Tell the price chart which symbol to draw and which layers to show. Python draws the candles. Use when the user asks to chart, plot, or compare two symbols. range is 1M, 3M, 6M, 1Y, or 5Y. ticker_b is an optional second Yahoo symbol drawn rebased to 100. overlays: sma20, sma50, sma200, bb. panels: volume, rsi, macd. marks=backtest plus a rule (rsi_oversold, ma_cross, breakout, macd_cross) draws that rule's trades and the 70/30 split.",
+        "args": {"ticker": "string", "range": "1Y", "ticker_b": "", "overlays": ["sma50", "sma200", "bb"], "panels": ["volume", "rsi", "macd"], "marks": "none", "rule": ""},
     },
     {
         "name": "run_analysis",
@@ -1259,156 +2227,199 @@ AGENT_TOOL_MANIFEST = [
     },
 ]
 
-SUGGESTION_BASKET = ["MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+def _parse_json_obj(raw: str) -> dict | None:
+    """First JSON object in an LLM reply, tolerating code fences and chatter."""
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(raw)):
+        if raw[i] == "{":
+            depth += 1
+        elif raw[i] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(raw[start:i + 1])
+                    return obj if isinstance(obj, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None
 
-SUGGESTION_RE = re.compile(
-    r"\b(suggest|suggestion|recommend|recommendation|best stock|top stock|"
-    r"other stock|other shares|what else|watchlist|pick|idea)\b"
-    r"|\u0938\u0941\u091d\u093e|\u0938\u093f\u092b\u093e\u0930\u093f\u0936|"
-    r"\u0914\u0930 \u0936\u0947\u092f\u0930|\u0930\u093f\u0915\u092e\u0947\u0902\u0921",
-    re.I,
+
+AGENT_MAX_STEPS = 6     # LLM turns before we stop and answer with what we have
+AGENT_MAX_CALLS = 14    # tool calls across all turns
+
+AGENT_LOOP_PROMPT = (
+    "You are a market research agent that works in steps. Each turn you see the "
+    "user's question and every tool result so far, then decide the next move. "
+    "Reply with ONLY one JSON object, either\n"
+    '{"thought": "<under 40 words: what the last results showed and what you need next>", '
+    '"tools": [{"name": "...", "args": {...}}]}   (1-3 calls, run this turn)\n'
+    "or\n"
+    '{"thought": "<why the evidence now answers the question>", "done": true}\n\n'
+    "How to work:\n"
+    "- Look, then decide. Start with what tells you what you are dealing with, "
+    "then follow up on what the results actually show. If indicators show RSI "
+    "under 30, backtest rsi_oversold; if a trend is in place, backtest ma_cross or "
+    "breakout; if a backtest has too few trades, retry with years=10 or another "
+    "rule; if a symbol returns an error, retry with the company name.\n"
+    "- Never repeat a call with the same arguments.\n"
+    "- Prefer the deterministic tools (indicators, risk_metrics, forecast_range, "
+    "backtest_rule, verdict, pair_correlation) over get_history + run_analysis whenever they "
+    "cover the question: they cannot miscompute. 'Outperforming the market / vs "
+    "NIFTY / vs the S&P' is indicators (relative_strength).\n"
+    "- Stay on the symbols the user asked about. If one has no data after one "
+    "retry, stop and report that; never switch to the UI-selected asset or any "
+    "other ticker in its place.\n"
+    "- ticker takes any yfinance symbol (AAPL, BTC-USD, GC=F, ^NSEI, INR=X). Indian "
+    "stocks use .NS (HAL.NS). If unsure, put the company name and it is looked up.\n"
+    "- Buy, sell, hold, exit, outlook, or 'which way' questions: call verdict on the "
+    "matching rule (oversold -> rsi_oversold, trend -> ma_cross, breakout -> breakout, "
+    "MACD -> macd_cross). verdict.direction is the answer: long, flat, or no-edge. "
+    "If the user says 1 minute, 5 minute, or 15 minute, set interval to 1m, 5m, or 15m. "
+    "Otherwise leave interval at 1d. Also call chart_spec with marks=backtest and that same rule. "
+    "Do not pick a direction yourself, and do not name a position size.\n"
+    "- Correlation, beta, 'does A lead B': pair_correlation (set lag for lead questions), "
+    "and chart_spec with ticker_b so both series are on the chart.\n"
+    "- A request to chart or plot a symbol: chart_spec for that symbol. Python draws it.\n"
+    "- Requests for other stock ideas: get_quote + fundamental_facts on several real "
+    "candidates first, so any idea comes from data.\n"
+    "- run_analysis is for computations no other tool covers; give it a precise question.\n"
+    "- Say done as soon as the evidence answers the question. The written answer "
+    "comes in a later step, not here."
 )
 
 
-def agent_select_tools(question: str, tickers: list[str], selected: str,
-                       provider: str = "opencode-free", model: str = "") -> list[tuple]:
-    """The LLM chooses which tools to call (function-calling style).
+def agent_loop(question: str, tickers: list[str], selected: str,
+               provider: str = "", model: str = "",
+               on_step=None) -> tuple[list[dict], list[dict]]:
+    """The agent's control loop. Every turn the LLM re-reads the question and
+    all observations so far, then picks the next tool calls or stops. Python
+    only executes and records: it never decides what gets called.
 
-    tickers: every symbol resolved from the question (may be empty).
-    selected: the asset currently selected in the sidebar UI.
-
-    Returns a list of (tool_name, args) tuples. Falls back to a sensible
-    default pair if the LLM's JSON cannot be parsed.
-    """
+    Returns (results, trace). results feed the final answer; trace is the
+    step-by-step reasoning shown in the UI. on_step(step) fires after each turn."""
     manifest_text = "\n".join(
         f"- {t['name']}({json.dumps(t['args'])}) — {t['description']}" for t in AGENT_TOOL_MANIFEST
     )
     ticker_ctx = ", ".join(tickers) if tickers else "none detected"
-    prompt = (
-        f"User question: {question}\n"
-        f"Ticker(s) detected in question: {ticker_ctx}\n"
-        f"Selected asset in the UI: {selected}\n\n"
-        f"Available tools:\n{manifest_text}\n\n"
-        "Return STRICT JSON listing the tools to call, in the order you want their "
-        "results: {\"tools\": [{\"name\": \"get_quote\", \"args\": {\"ticker\": \"AAPL\"}}]}. "
-        "The \"ticker\" argument accepts ANY valid yfinance symbol the user mentions "
-        "(AAPL, AMD, BTC-USD, GBPUSD=X, ^SPX...), even if it is not in the list above. "
-        "For multi-ticker questions, call get_quote for EACH ticker asked about. "
-        "Include get_history when the question needs price trends or computations, "
-        "run_analysis for anything requiring calculation (volatility, VaR, "
-        "Sharpe, RSI, forecasts, correlations), and fundamental_facts for valuation "
-        "or earnings questions. Use at most 4 tools (up to 10 for suggestion "
-        "questions below). If the user asks for stock suggestions or "
-        "recommendations of OTHER stocks (e.g. 'suggest other stocks', "
-        "'कुछ और शेयर सुझाओ', 'recommendations'), call get_quote AND "
-        "fundamental_facts for several well-known candidates (e.g. MSFT, GOOGL, "
-        "AMZN, NVDA, TSLA) so the suggestions come from real data. "
-        "If no tool helps, return "
-        "{\"tools\": []}."
-    )
-    resp = llm_chat([
-        {"role": "system", "content": (
-            "You are a tool-selection router. Output ONLY the JSON object, "
-            "no markdown, no commentary.")},
-        {"role": "user", "content": prompt},
-    ], temperature=0.0, max_tokens=500, provider=provider, model=model)
-
+    valid = {t["name"] for t in AGENT_TOOL_MANIFEST}
     primary = tickers[0] if tickers else selected
-    selected_calls = []
-    parsed = None
-    if resp.get("ok") and resp.get("text"):
-        raw = resp["text"].strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("{")
-            if start >= 0:
-                depth = 0
-                for i in range(start, len(raw)):
-                    if raw[i] == "{":
-                        depth += 1
-                    elif raw[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            parsed = json.loads(raw[start:i + 1])
-                            break
-        if isinstance(parsed, dict):
-            valid = {t["name"] for t in AGENT_TOOL_MANIFEST}
-            for item in parsed.get("tools", [])[:12]:
-                name = item.get("name", "")
-                if name in valid:
-                    args = item.get("args") or {}
-                    if name == "run_analysis":
-                        args["question"] = question
-                    if "ticker" not in args:
-                        args["ticker"] = primary
-                    selected_calls.append((name, args))
+    results, trace, observations, seen = [], [], [], set()
 
-    # Deterministic fallback if selection failed
-    if not selected_calls:
-        selected_calls = [
-            ("get_quote", {"ticker": primary}),
-            ("run_analysis", {"ticker": primary, "question": question}),
-            ("fundamental_facts", {"ticker": primary}),
-        ]
+    for step in range(1, AGENT_MAX_STEPS + 1):
+        user = (
+            f"User question: {question}\n"
+            f"Ticker(s) detected in question: {ticker_ctx}\n"
+            f"Selected asset in the UI: {selected}\n\n"
+            f"Tools:\n{manifest_text}\n\n"
+            "Observations so far:\n"
+            + ("\n\n".join(observations) or "(none yet: this is your first step)")
+            + f"\n\nStep {step} of {AGENT_MAX_STEPS}. Your JSON:"
+        )
+        msgs = [{"role": "system", "content": AGENT_LOOP_PROMPT},
+                {"role": "user", "content": user}]
+        # Reasoning models on the free tiers spend part of max_tokens thinking,
+        # so the budget is generous and a cut-off reply gets one retry.
+        resp = llm_chat(msgs, temperature=0.0, max_tokens=1500, provider=provider, model=model)
+        decision = _parse_json_obj(resp.get("text", "")) if resp.get("ok") else None
+        if not decision and resp.get("ok"):
+            msgs += [{"role": "assistant", "content": resp.get("text", "")},
+                     {"role": "user", "content": "That reply was cut off or not valid JSON. "
+                      "Send the JSON object again, thought under 25 words."}]
+            resp = llm_chat(msgs, temperature=0.0, max_tokens=1500, provider=provider, model=model)
+            decision = _parse_json_obj(resp.get("text", "")) if resp.get("ok") else None
+        if not decision:
+            trace.append({"step": step, "thought": "agent reply was not valid JSON; stopping here", "calls": []})
+            break
 
-    # Suggestion/recommendation requests: the question names no other ticker,
-    # so fetch a candidate basket to make suggestions come from real data.
-    # Deterministic — never depends on the router LLM deciding to do it.
-    if SUGGESTION_RE.search(question):
-        asked = {t.upper() for t in tickers}
-        for s in SUGGESTION_BASKET:
-            if s in asked or any(str(a.get("ticker", "")).upper() == s for _, a in selected_calls):
+        thought = str(decision.get("thought", ""))[:300]
+        calls = decision.get("tools") or []
+        if decision.get("done") or not calls:
+            trace.append({"step": step, "thought": thought, "calls": [], "done": True})
+            if on_step:
+                on_step(trace[-1])
+            break
+
+        ran = []
+        for item in calls[:3]:
+            if len(results) >= AGENT_MAX_CALLS:
+                break
+            name = item.get("name", "") if isinstance(item, dict) else ""
+            if name not in valid:
+                observations.append(f"[step {step}] '{name}' is not a tool")
                 continue
-            selected_calls.append(("get_quote", {"ticker": s}))
-            selected_calls.append(("fundamental_facts", {"ticker": s}))
-    return selected_calls
+            args = dict(item.get("args") or {})
+            args["ticker"] = normalize_ticker(str(args.get("ticker", ""))) or primary
+            if args.get("ticker_b"):
+                args["ticker_b"] = normalize_ticker(str(args["ticker_b"]))
+            if name == "run_analysis":
+                args["question"] = args.get("question") or question
+                args["tickers"] = list(dict.fromkeys([args["ticker"], *tickers]))
+            key = name + json.dumps(args, sort_keys=True, default=str)
+            shown = {k: v for k, v in args.items() if k != "tickers"}
+            if key in seen:
+                observations.append(f"[step {step}] {name}{json.dumps(shown, default=str)}: already called, see above")
+                continue
+            seen.add(key)
+            try:
+                result = run_tool(name, args, provider, model)
+            except Exception as e:
+                result = {"error": str(e)[:150]}
+            results.append({"tool": name, "args": args, "result": result})
+            observations.append(f"[step {step}] {name}{json.dumps(shown, default=str)} ->\n"
+                                f"{json.dumps(result, default=str)[:2500]}")
+            label = args["ticker"] + (f", {args['ticker_b']}" if args.get("ticker_b") else "")
+            if args.get("rule"):
+                label += f", {args['rule']}"
+            ran.append(f"{name}({label})")
+
+        trace.append({"step": step, "thought": thought, "calls": ran})
+        if on_step:
+            on_step(trace[-1])
+        if len(results) >= AGENT_MAX_CALLS:
+            break
+
+    # The LLM providers can all be down or rate-limited at once; answer from a
+    # basic snapshot rather than nothing.
+    if not results:
+        for name in ("get_quote", "indicators", "fundamental_facts"):
+            args = {"ticker": primary}
+            try:
+                result = run_tool(name, args, provider, model)
+            except Exception as e:
+                result = {"error": str(e)[:150]}
+            results.append({"tool": name, "args": args, "result": result})
+        trace.append({"step": len(trace) + 1,
+                      "thought": "no usable plan from the agent; fetched a default snapshot",
+                      "calls": [f"{r['tool']}({primary})" for r in results]})
+        if on_step:
+            on_step(trace[-1])
+    return results, trace
 
 
-def prepare_answer(question: str, provider: str = "opencode-free", model: str = "",
-                   history: list[dict] | None = None) -> dict:
-    """Agentic flow: resolve every ticker asked about → LLM picks tools →
-    we execute → build synthesis context. Returns the messages to stream
-    plus metadata for the UI.
+def prepare_answer(question: str, provider: str = "", model: str = "",
+                   history: list[dict] | None = None, on_step=None) -> dict:
+    """Agentic flow: resolve tickers named in the question → the agent loop
+    gathers evidence step by step → build the synthesis context. Returns the
+    messages to stream plus the trace for the UI.
     """
     tickers = resolve_tickers(question)
     selected = st.session_state.get("_sidebar_ticker", "AAPL") or "AAPL"
+
+    results, trace = agent_loop(question, tickers, selected, provider, model, on_step)
     if not tickers:
-        tickers = [selected]
-
-    tool_calls = agent_select_tools(question, tickers, selected, provider, model)
-
-    # Data guarantee: every ticker the user asked about gets at least one call.
-    used = {str(a.get("ticker", "")).upper() for _, a in tool_calls}
-    for t in tickers:
-        if t.upper() not in used:
-            tool_calls.append(("get_quote", {"ticker": t}))
-
-    # Correlation/link questions get the deterministic pair tool so they can
-    # never collapse on buggy LLM-written code.
-    if (len(tickers) >= 2
-            and re.search(r"\b(correl|beta|co.mov|covary|cointegrat|diversif|link)\b",
-                          question, re.I)
-            and not any(n == "pair_correlation" for n, _ in tool_calls)):
-        tool_calls.append(("pair_correlation",
-                           {"ticker": tickers[0], "ticker_b": tickers[1]}))
-
-    # run_analysis always learns every asked ticker (primary first).
-    for name, args in tool_calls:
-        if name == "run_analysis":
-            args["tickers"] = tickers
-
-    results = []
-    for name, args in tool_calls:
-        try:
-            results.append({"tool": name, "args": args,
-                            "result": run_tool(name, args, provider, model)})
-        except Exception as e:
-            results.append({"tool": name, "args": args,
-                            "result": {"error": str(e)[:150]}})
+        tickers = list(dict.fromkeys(r["args"]["ticker"] for r in results)) or [selected]
 
     ctx_lines = []
     for r in results:
@@ -1430,21 +2441,29 @@ def prepare_answer(question: str, provider: str = "opencode-free", model: str = 
         "3. Present facts (vol, VaR, RSI, earnings date, valuation) and clearly label any interpretation.\n"
         "4. ALWAYS answer the user's question directly from the data. Never refuse, "
         "never say 'I cannot determine', never return an empty reply. When the exact "
-        "metric is missing, give the closest available figure and name the gap.\n"
+        "metric is missing, give the closest available figure and name the gap. "
+        "If an asked symbol has no data at all, say so plainly and do not "
+        "substitute analysis of a different asset.\n"
         "5. When multiple tickers were asked about, answer for each one as a clear "
         "per-ticker breakdown, and compare them when the question asks.\n"
-        "6. Provide information and analysis; avoid personalized trade advice or "
-        "price targets.\n"
-        "7. FORECASTS: when asked for an outlook/forecast/prediction, give a "
-        "probabilistic range based on computed volatility (from run_analysis output), "
-        "framed with confidence, and ALWAYS append the standard warning below verbatim.\n"
+        "6. Provide information and analysis. Do not invent a position size or an order.\n"
+        "7. When verdict is in TOOL DATA, that payload's direction is the answer: "
+        "long, flat, or no-edge. Lead with it and quote summary, the 70% and 95% "
+        "ranges, and the band hit rates. Do not replace the direction with your own view. "
+        "ALWAYS append the standard warning below verbatim.\n"
         "8. Report numbers exactly as produced by tool output or run_analysis "
-        "execution results.\n"
+        "execution results. Every figure you state must be in TOOL DATA: no "
+        "support/resistance levels, index levels, volatility of assets that were "
+        "not fetched, or earnings dates from memory. Market context without data "
+        "behind it is fine as words, never as numbers. Simple arithmetic on tool "
+        "figures (a % gap between two of them) is allowed.\n"
         "9. End with a one-line 'Bottom line' summary.\n"
         "10. If the user asked for suggestions or recommendations of OTHER stocks, "
         "recommend ONLY from the candidate data present in TOOL DATA — never "
         "recommend a ticker whose data is absent, and cite each candidate's "
-        "price and valuation from the tool output.\n\n"
+        "price and valuation from the tool output.\n"
+        "11. If the user asked which way a symbol is leaning and verdict is missing, "
+        "say the tested direction was not computed. Do not fill the gap from memory.\n\n"
         "STANDARD WARNING (append verbatim to any forecast):\n"
         "\"⚠️ This is not investment advice. Forecasts are probabilistic "
         "estimates based on historical volatility; markets can move beyond any "
@@ -1469,12 +2488,14 @@ def prepare_answer(question: str, provider: str = "opencode-free", model: str = 
     return {
         "ticker": selected,
         "tickers": tickers,
-        "tools_used": [t for t, _ in tool_calls],
+        "tools_used": [r["tool"] for r in results],
+        "results": results,
+        "trace": trace,
         "messages": messages,
     }
 
 
-def answer_question(question: str, provider: str = "opencode-free", model: str = "",
+def answer_question(question: str, provider: str = "", model: str = "",
                     history: list[dict] | None = None) -> dict:
     """Non-streaming path: run tools then get the full answer."""
     prep = prepare_answer(question, provider, model, history)
@@ -1483,6 +2504,8 @@ def answer_question(question: str, provider: str = "opencode-free", model: str =
         "answer": resp.get("text", f"LLM error: {resp.get('error', '?')}"),
         "ticker": prep["ticker"],
         "tools_used": prep["tools_used"],
+        "results": prep["results"],
+        "trace": prep["trace"],
         "model": resp.get("model", "?"),
         "provider": resp.get("provider", provider),
     }
@@ -1554,11 +2577,31 @@ def sidebar():
 
         st.markdown("---")
         st.markdown("### 🤖 LLM Provider")
-        provider = st.selectbox("Provider:", list(LLM_PROVIDERS.keys()), index=0)
-        model_choice = st.selectbox(
-            "Model:", LLM_PROVIDERS[provider]["models"], index=0,
-            help=f"{LLM_PROVIDERS[provider]['tag']} · auto-fallback across providers on failure",
+        provider_choice = st.selectbox(
+            "Provider:",
+            ["Auto (failover)"] + LLM_PROVIDER_ORDER,
+            help="Auto walks Groq, Gemini (free tier), NVIDIA, Kilo, then opencode, "
+                 "skipping providers without a key and models that recently failed. "
+                 "A pinned provider is tried first. Models load from each provider's /models endpoint.",
         )
+        with st.expander("Provider status", expanded=False):
+            for row in provider_status():
+                live = f"{row['live_models']} live" if row["live_models"] else "unavailable"
+                first = f" · first: `{row['first']}`" if row["first"] else ""
+                st.markdown(f"**{row['provider']}** · {row['key']} · {live}{first}")
+            st.caption("Keys are read from Streamlit secrets, environment variables, "
+                       "or ~/.hermes/.env. Groq and NVIDIA keys are free to create.")
+        if provider_choice == "Auto (failover)":
+            provider, model_choice = "", ""
+            st.caption("Models are chosen per call from the live failover chain.")
+        else:
+            provider = provider_choice
+            model_opts = available_models(provider) or LLM_PROVIDERS[provider]["models"]
+            model_choice = st.selectbox(
+                "Model:", model_opts,
+                help="Live list from /models, curated free models first. "
+                     "Falls back to the built-in list if the endpoint is unreachable.",
+            )
 
         auto_refresh = st.checkbox("🔄 Auto-refresh price chart (60s)", value=False)
 
@@ -1568,7 +2611,7 @@ def sidebar():
         st.markdown("---")
         st.markdown(
             '<small style="color:#888;">Facts, sources, and quantified uncertainty — '
-            'every figure computed from live data.<br>Portfolio Edition · opencode-free + NVIDIA + Groq</small>',
+            'every figure computed from live data.<br>Groq · Gemini · NVIDIA · Kilo · opencode, models loaded live</small>',
             unsafe_allow_html=True,
         )
         return {
@@ -1583,103 +2626,467 @@ def sidebar():
 
 
 # ── Tab 1: Price Chart ──
-def draw_candles(ax, df, window: int = 120):
-    """Hand-rolled candlesticks (no mplfinance dependency)."""
-    d = df.tail(window)
-    up = d["Close"] >= d["Open"]
-    for i in range(len(d)):
-        o, c, h, l = d["Open"].iloc[i], d["Close"].iloc[i], d["High"].iloc[i], d["Low"].iloc[i]
-        color = "#1f8a4c" if up.iloc[i] else "#c62828"
-        ax.plot([i, i], [l, h], color=color, lw=0.7)
-        body_bottom = min(o, c)
-        body_top = max(o, c)
-        ax.add_patch(Rectangle((i - 0.35, body_bottom), 0.7, max(body_top - body_bottom, 1e-9),
-                               facecolor=color, edgecolor=color))
-    ax.set_xlim(-0.6, len(d) - 0.4)
-    # X ticks: dates every ~nth bar
-    step = max(1, len(d) // 6)
-    ticks = list(range(0, len(d), step))
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([d.index[i].strftime("%m-%d") for i in ticks], rotation=30, ha="right")
-    return d
+# Bars kept for each range button. Daily charts request enough history for the
+# button; intraday charts use the sidebar interval's own window.
+CHART_RANGES = {"1M": 22, "3M": 66, "6M": 132, "1Y": 252, "5Y": 1260}
+TAPE = ["NVDA", "BTC-USD", "RELIANCE.NS", "GC=F", "INR=X", "^NSEI"]
+CHART_OVERLAYS = ("sma20", "sma50", "sma200", "bb")
+CHART_PANELS = ("volume", "rsi", "macd")
+
+
+def _as_str_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value]
+
+
+def chart_history(ticker: str, interval: str, range_key: str, need_long: bool) -> pd.DataFrame:
+    """Bars for the chart. Daily + rule marks load five years so the 70/30
+    split is the same window the backtest uses. Intraday keeps the interval window."""
+    if interval != "1d":
+        return get_history(ticker, interval, interval_period(interval))
+    if need_long or range_key == "5Y":
+        period = "5y"
+    elif range_key in ("1Y", "6M"):
+        period = "2y"
+    else:
+        period = "1y"
+    df = get_history(ticker, "1d", period)
+    if need_long:
+        return df
+    return df.tail(CHART_RANGES.get(range_key, 252))
+
+
+def rule_trade_marks(df: pd.DataFrame, rule: str, params: dict | None = None) -> list[dict]:
+    """Buy and sell dates using the same next-bar fill as the backtest."""
+    if df is None or df.empty or rule not in BACKTEST_RULES:
+        return []
+    try:
+        pos = _rule_positions(df, rule, params or {})
+    except ValueError:
+        return []
+    held = pos.shift(1).fillna(0)
+    flips = held.diff()
+    flips.iloc[0] = held.iloc[0]
+    marks = []
+    for ts, v in flips.items():
+        side = "buy" if v == 1 else "sell" if v == -1 else ""
+        if side:
+            marks.append({"date": ts, "side": side, "price": float(df.loc[ts, "Close"])})
+    return marks
+
+
+def _marks_on_view(marks: list[dict], view: pd.DataFrame) -> list[dict]:
+    if view.empty or not marks:
+        return []
+    start, end = view.index[0], view.index[-1]
+    kept = []
+    for m in marks:
+        ts = pd.Timestamp(m["date"]).tz_localize(None) if pd.Timestamp(m["date"]).tzinfo else pd.Timestamp(m["date"])
+        if start <= ts <= end:
+            kept.append({**m, "date": ts})
+    return kept
+
+
+def build_research_figure(df: pd.DataFrame, *, compare: pd.DataFrame | None = None,
+                          compare_name: str = "",
+                          overlays: tuple | list = CHART_OVERLAYS,
+                          panels: tuple | list = CHART_PANELS,
+                          marks: list[dict] | None = None,
+                          split_at=None, cone: dict | None = None,
+                          title: str = "") -> go.Figure | None:
+    """Candles plus the panels and overlays the chart tab (or chart_spec) asked for.
+
+    A comparison series is rebased to 100 on a second axis so a coin and a
+    stock can share the time axis. Python draws every mark. The model only
+    chooses which of these layers to turn on.
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    overlays = tuple(overlays or ())
+    panels = tuple(p for p in (panels or ()) if p in CHART_PANELS)
+    if panels:
+        rest = 0.42 / len(panels)
+        heights = [0.58] + [rest] * len(panels)
+    else:
+        heights = [1]
+    specs = [[{"secondary_y": True}]] + [[{"secondary_y": False}] for _ in panels]
+    fig = make_subplots(
+        rows=1 + len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.035,
+        row_heights=heights, specs=specs,
+    )
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Price",
+        increasing_line_color="#1f8a4c", decreasing_line_color="#c62828",
+        increasing_fillcolor="#1f8a4c", decreasing_fillcolor="#c62828",
+    ), row=1, col=1, secondary_y=False)
+
+    close = df["Close"]
+    sma_colors = {"sma20": "#f59e0b", "sma50": "#7B2D8E", "sma200": "#1565c0"}
+    for n, key in ((20, "sma20"), (50, "sma50"), (200, "sma200")):
+        if key in overlays and len(df) >= n:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=close.rolling(n).mean(), name=key.upper(),
+                line=dict(color=sma_colors[key], width=1.2),
+            ), row=1, col=1, secondary_y=False)
+    if "bb" in overlays and len(df) >= 20:
+        mid, sd = close.rolling(20).mean(), close.rolling(20).std()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=mid + 2 * sd, name="BB upper",
+            line=dict(color="#90a4ae", width=1, dash="dot"),
+        ), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=mid - 2 * sd, name="BB lower",
+            line=dict(color="#90a4ae", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(144,164,174,0.12)",
+        ), row=1, col=1, secondary_y=False)
+    if compare is not None and not compare.empty and "Close" in compare.columns:
+        both = pd.concat({"a": close, "b": compare["Close"]}, axis=1).dropna()
+        if len(both) > 2:
+            fig.add_trace(go.Scatter(
+                x=both.index, y=both["b"] / both["b"].iloc[0] * 100,
+                name=f"{compare_name or 'compare'} rebased",
+                line=dict(color="#C9A84C", width=1.4),
+            ), row=1, col=1, secondary_y=True)
+
+    marker_style = {
+        "buy": ("triangle-up", "#1f8a4c"),
+        "sell": ("triangle-down", "#c62828"),
+        "news": ("circle", "#546e7a"),
+    }
+    for side, (symbol, color) in marker_style.items():
+        pts = [m for m in (marks or []) if m.get("side") == side]
+        if not pts:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[pd.Timestamp(m["date"]) for m in pts],
+            y=[m.get("price") for m in pts],
+            mode="markers", name=side,
+            text=[m.get("title", side) for m in pts],
+            marker=dict(symbol=symbol, size=9, color=color),
+        ), row=1, col=1, secondary_y=False)
+
+    if split_at is not None and len(df):
+        ts = pd.Timestamp(split_at)
+        if df.index[0] <= ts <= df.index[-1]:
+            fig.add_vline(x=ts, line_dash="dash", line_color="#7B2D8E", row=1, col=1)
+
+    if cone and cone.get("range_95") and len(df):
+        last = df.index[-1]
+        horizon = max(int(cone.get("horizon") or cone.get("horizon_bars") or 7), 1)
+        step = df.index.to_series().diff().median()
+        if pd.notna(step) and step < pd.Timedelta(days=1):
+            future = pd.date_range(last, periods=horizon + 1, freq=step)[1:]
+        else:
+            future = pd.bdate_range(last, periods=horizon + 1)[1:]
+        px = float(close.iloc[-1])
+        if len(future):
+            end = future[-1]
+            fills = {"range_95": "rgba(123,45,142,0.10)", "range_70": "rgba(201,168,76,0.20)"}
+            for key in ("range_95", "range_70"):
+                band = cone.get(key)
+                if not band or len(band) != 2:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=[last, end, end, last],
+                    y=[px, band[0], band[1], px],
+                    fill="toself", name=key, mode="lines",
+                    line=dict(width=0), fillcolor=fills[key],
+                ), row=1, col=1, secondary_y=False)
+
+    up = close >= df["Open"]
+    row = 2
+    if "volume" in panels and "Volume" in df.columns:
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["Volume"], name="Volume",
+            marker_color=["#1f8a4c" if flag else "#c62828" for flag in up],
+        ), row=row, col=1)
+        row += 1
+    if "rsi" in panels and len(df) > 15:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=rsi_series(close), name="RSI",
+            line=dict(color="#7B2D8E", width=1.2),
+        ), row=row, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#c62828", row=row, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#1f8a4c", row=row, col=1)
+        row += 1
+    if "macd" in panels and len(df) > 26:
+        macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        signal = macd.ewm(span=9, adjust=False).mean()
+        hist = macd - signal
+        fig.add_trace(go.Bar(
+            x=df.index, y=hist, name="MACD hist",
+            marker_color=["#1f8a4c" if v >= 0 else "#c62828" for v in hist.fillna(0)],
+        ), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=macd, name="MACD", line=dict(color="#1565c0", width=1.1),
+        ), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=signal, name="MACD signal", line=dict(color="#f59e0b", width=1.1),
+        ), row=row, col=1)
+
+    fig.update_layout(
+        title=title,
+        height=300 + 150 * max(len(panels), 0),
+        margin=dict(l=8, r=8, t=48, b=8),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis_rangeslider_visible=False,
+        template="plotly_white",
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
+    if compare is not None and not getattr(compare, "empty", True):
+        fig.update_yaxes(title_text="Rebased 100", row=1, col=1, secondary_y=True)
+    return fig
+
+
+def set_chart_spec(args: dict) -> dict:
+    """Record which ticker and layers the chart should show. Drawing happens
+    in the price tab, from this record, not inside the model."""
+    rng = str(args.get("range") or "1Y")
+    if rng not in CHART_RANGES:
+        rng = "1Y"
+    overlays = [o for o in _as_str_list(args.get("overlays")) if o in CHART_OVERLAYS]
+    panels = [p for p in _as_str_list(args.get("panels")) if p in CHART_PANELS]
+    rule = str(args.get("rule") or "")
+    if rule not in BACKTEST_RULES:
+        rule = ""
+    marks = "backtest" if str(args.get("marks") or "") == "backtest" and rule else "none"
+    compare = normalize_ticker(str(args.get("ticker_b") or args.get("compare") or ""))
+    spec = {
+        "ticker": normalize_ticker(str(args.get("ticker") or "")),
+        "range": rng,
+        "compare": compare,
+        "overlays": overlays or list(CHART_OVERLAYS),
+        "panels": panels or list(CHART_PANELS),
+        "marks": marks,
+        "rule": rule,
+    }
+    try:
+        st.session_state["chart_spec"] = spec
+        if spec["ticker"]:
+            st.session_state["chart_focus"] = spec["ticker"]
+    except Exception:
+        pass
+    return spec
+
+
+def _apply_chart_spec(spec: dict) -> None:
+    """Push a new agent spec into the chart widgets once. Later clicks stay."""
+    sig = json.dumps(spec, sort_keys=True, default=str)
+    if not spec or st.session_state.get("_chart_spec_sig") == sig:
+        return
+    st.session_state["_chart_spec_sig"] = sig
+    st.session_state["chart_range"] = spec.get("range") or "1Y"
+    st.session_state["chart_compare"] = spec.get("compare") or ""
+    ov = set(spec.get("overlays") or CHART_OVERLAYS)
+    pn = set(spec.get("panels") or CHART_PANELS)
+    st.session_state["ov_sma"] = bool(ov & {"sma20", "sma50", "sma200"})
+    st.session_state["ov_bb"] = "bb" in ov
+    st.session_state["ov_rsi"] = "rsi" in pn
+    st.session_state["ov_macd"] = "macd" in pn
+    st.session_state["ov_volume"] = "volume" in pn
+    st.session_state["ov_marks"] = spec.get("marks") == "backtest"
+    if spec.get("rule") in BACKTEST_RULES:
+        st.session_state["ov_rule"] = spec["rule"]
+    if spec.get("ticker"):
+        st.session_state["chart_focus"] = spec["ticker"]
 
 
 def price_chart_tab(ticker: str, interval: str, auto_refresh: bool):
-    st.markdown(f"### 📈 {ticker} — Price Chart")
+    spec = st.session_state.get("chart_spec") or {}
+    _apply_chart_spec(spec)
+    focus = st.session_state.get("chart_focus") or ticker
+
+    st.markdown(f"### 📈 {focus}")
+    bench = benchmark_for(focus)
     st.caption(
-        f"Interval: {interval} → history window: {interval_period(interval)} · "
-        f"data as of {fresh_stamp()} · historical data with moving averages and volume"
+        f"{market_of(focus)} · benchmark {bench or 'none'} · interval {interval} · "
+        f"as of {fresh_stamp()} · any Yahoo Finance symbol"
     )
 
-    chart_type = st.radio("Chart type:", ["Line + MA", "Candlestick"], horizontal=True)
+    tape_cols = st.columns(len(TAPE))
+    for i, sym in enumerate(TAPE):
+        q = get_quote(sym)
+        price = q.get("price")
+        chg = q.get("day_change_pct")
+        tape_cols[i].metric(
+            sym,
+            f"{price:,.2f}" if price else "—",
+            delta=f"{chg:.2f}%" if chg is not None else None,
+        )
+        if tape_cols[i].button(sym, key=f"tape_{sym}", use_container_width=True):
+            st.session_state["chart_focus"] = sym
+            st.rerun()
 
-    # Auto-refresh: when enabled, Streamlit re-runs this fragment every 60s.
-    # yfinance calls are still throttled by the 5-minute data cache.
+    if focus != ticker and st.button(f"Use sidebar ticker {ticker}", key="clear_focus"):
+        st.session_state.pop("chart_focus", None)
+        st.rerun()
+
+    defaults = {
+        "chart_range": "1Y",
+        "chart_compare": "",
+        "ov_sma": True,
+        "ov_bb": True,
+        "ov_rsi": True,
+        "ov_macd": True,
+        "ov_volume": True,
+        "ov_marks": False,
+        "ov_rule": "rsi_oversold",
+        "ov_direction": True,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+    range_key = st.radio("Range", list(CHART_RANGES), horizontal=True, key="chart_range")
+    controls = st.columns([2, 1, 1, 1, 1, 1, 1])
+    compare_sym = controls[0].text_input("Compare (any Yahoo symbol)", key="chart_compare")
+    show_bench = controls[1].checkbox("Benchmark", value=True)
+    show_sma = controls[2].checkbox("SMA", key="ov_sma")
+    show_bb = controls[3].checkbox("Bollinger", key="ov_bb")
+    show_rsi = controls[4].checkbox("RSI", key="ov_rsi")
+    show_macd = controls[5].checkbox("MACD", key="ov_macd")
+    show_volume = controls[6].checkbox("Volume", key="ov_volume")
+    extra = st.columns([1, 1.6, 1, 1, 1])
+    show_direction = extra[0].checkbox("Direction", key="ov_direction")
+    rule = extra[1].selectbox("Rule", list(BACKTEST_RULES), key="ov_rule")
+    show_marks = extra[2].checkbox("Rule marks", key="ov_marks")
+    show_cone = extra[3].checkbox("GARCH cone", value=False)
+    show_news = extra[4].checkbox("News dates", value=False)
+
     frag = st.fragment(run_every=60 if auto_refresh else None)
 
     @frag
-    def _chart_fragment(ticker: str, interval: str, chart_type: str):
-        df = get_history(ticker, interval, interval_period(interval))
-        if df.empty:
-            st.warning(f"No data found for {ticker} at {interval}.")
+    def _chart_fragment(focus: str, interval: str, range_key: str, compare_sym: str,
+                        show_bench: bool, show_sma: bool, show_bb: bool, show_rsi: bool,
+                        show_macd: bool, show_volume: bool, show_marks: bool, rule: str,
+                        show_cone: bool, show_news: bool, show_direction: bool):
+        need_long = bool(show_marks and interval == "1d")
+        full = chart_history(focus, interval, range_key, need_long)
+        if full.empty:
+            st.warning(f"No data found for {focus} at {interval}.")
             return
-
-        q = get_quote(ticker)
-        price = q.get("price")
-        chg = q.get("day_change_pct")
+        view = full.tail(CHART_RANGES.get(range_key, len(full))) if need_long else full
+        q = get_quote(focus)
+        price, chg = q.get("price"), q.get("day_change_pct")
+        head = st.columns(3)
         if price:
-            col_a, col_b, col_c = st.columns(3)
-            col_a.metric("Last Price", f"${price:,.2f}",
-                         delta=f"{chg:.2f}%" if chg is not None else None)
-            col_b.metric("Bars", f"{len(df):,}")
-            col_c.metric("History Window", interval_period(interval))
+            head[0].metric("Last", f"{price:,.4f}" if price < 5 else f"{price:,.2f}",
+                           delta=f"{chg:.2f}%" if chg is not None else None)
+        head[1].metric("Bars", f"{len(view):,}")
+        head[2].metric("Class", market_of(focus))
 
-        if chart_type == "Candlestick":
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1, figsize=(11, 6.5), sharex=False,
-                gridspec_kw={"height_ratios": [3, 1]}, dpi=110,
-            )
-            d = draw_candles(ax1, df)
-            ax1.set_ylabel("Price")
-            ax1.set_title(f"{ticker} — {interval} candlesticks (last {len(d)})")
-            ax1.grid(True, alpha=0.25)
-            ax2.bar(range(len(d)), d["Volume"], color="#9ca3af", alpha=0.6)
-            ax2.set_ylabel("Volume")
-            ax2.grid(True, alpha=0.25)
-        else:
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1, figsize=(11, 6.5), sharex=True,
-                gridspec_kw={"height_ratios": [3, 1]}, dpi=110,
-            )
-            ax1.plot(df.index, df["Close"], color="#1f77b4", lw=1.6, label="Close")
-            if len(df) >= 20:
-                ax1.plot(df.index, df["Close"].rolling(20).mean(), color="#f59e0b",
-                         lw=1.2, alpha=0.85, label="MA20")
-            if len(df) >= 50:
-                ax1.plot(df.index, df["Close"].rolling(50).mean(), color="#7B2D8E",
-                         lw=1.2, alpha=0.75, label="MA50")
-            ax1.set_ylabel("Price")
-            ax1.set_title(f"{ticker} — {interval} bars")
-            ax1.legend(fontsize=9, loc="upper left")
-            ax1.grid(True, alpha=0.25)
-            ax2.bar(df.index, df["Volume"], color="#9ca3af", alpha=0.6, width=0.8)
-            ax2.set_ylabel("Volume")
-            ax2.grid(True, alpha=0.25)
-            span_days = (df.index[-1] - df.index[0]).days if len(df) > 1 else 1
-            if span_days < 3:
-                fmt = "%H:%M"
-            elif span_days < 400:
-                fmt = "%Y-%m-%d"
-            else:
-                fmt = "%Y-%m"
-            for ax in (ax1, ax2):
-                ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
-                ax.tick_params(axis="x", rotation=30)
+        overlays = []
+        if show_sma:
+            overlays += ["sma20", "sma50", "sma200"]
+        if show_bb:
+            overlays.append("bb")
+        panels = []
+        if show_volume:
+            panels.append("volume")
+        if show_rsi:
+            panels.append("rsi")
+        if show_macd:
+            panels.append("macd")
 
-        fig.tight_layout()
-        st.pyplot(fig)
+        marks, split_at = [], None
+        short = interval in INTRADAY_INTERVALS
+        if rule and show_marks and (need_long or short):
+            marks = _marks_on_view(rule_trade_marks(full, rule), view)
+            if len(full) > 10:
+                split_at = full.index[int(len(full) * 0.7)]
+        elif show_marks:
+            st.caption("Rule marks run on 1d, 1m, 5m, and 15m.")
 
-    _chart_fragment(ticker, interval, chart_type)
+        other = (compare_sym or "").strip()
+        if not other and show_bench:
+            other = benchmark_for(focus) or ""
+        compare_df = None
+        if other and normalize_ticker(other) != focus:
+            other = normalize_ticker(other)
+            compare_df = chart_history(other, interval, range_key, False)
+
+        card = None
+        if show_direction and rule and (interval == "1d" or short):
+            card = verdict(focus, rule, years=5, horizon_days=7, interval=interval)
+        elif show_direction:
+            st.caption("Direction runs on 1d, 1m, 5m, and 15m.")
+
+        cone = None
+        if (interval == "1d" or short) and (show_cone or card):
+            band = (card or {}).get("forecast") if card and not card.get("error") else None
+            if not band or not band.get("range_95"):
+                if short:
+                    band = _intraday_cone(full["Close"], INTRADAY_HORIZON_BARS[interval])
+                elif show_cone:
+                    band = forecast_range(focus)
+                else:
+                    band = None
+            if band and band.get("range_95"):
+                cone = band
+        elif show_cone:
+            st.caption("The volatility cone runs on 1d, 1m, 5m, and 15m.")
+
+        if show_news:
+            for story in get_ticker_news(focus, limit=8):
+                raw = (story.get("date") or "")[:10]
+                if not raw:
+                    continue
+                day = pd.Timestamp(raw)
+                hits = view.index[view.index.normalize() == day]
+                if len(hits):
+                    ts = hits[-1]
+                    marks.append({
+                        "date": ts, "side": "news",
+                        "price": float(view.loc[ts, "Close"]),
+                        "title": story.get("title") or "news",
+                    })
+
+        fig = build_research_figure(
+            view, compare=compare_df, compare_name=other,
+            overlays=overlays, panels=panels, marks=marks,
+            split_at=split_at, cone=cone, title=focus,
+        )
+        if fig is None:
+            st.warning(f"No chart for {focus}.")
+            return
+        st.plotly_chart(fig, use_container_width=True)
+        if card and card.get("error"):
+            st.caption(card["error"])
+        elif card:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Direction", card["direction"])
+            c2.metric("Rule now", card["rule_position"])
+            unit = "bar" if card.get("interval") in INTRADAY_INTERVALS else "day"
+            c3.metric("OOS excess", f"{card['oos']['excess_mean_bps']:.1f} bps/{unit}")
+            hit = (card.get("forecast") or {}).get("band70_hit_rate")
+            c4.metric("70% band hit", f"{hit:.0%}" if hit is not None else "—")
+            st.caption(card["summary"])
+        bits = [f"range {range_key}"]
+        if other:
+            bits.append(f"compared with {other}, rebased to 100")
+        if split_at is not None:
+            bits.append(f"dashed line is the 70/30 split on {str(pd.Timestamp(split_at).date())}")
+        if cone and interval in INTRADAY_INTERVALS:
+            bits.append(f"shaded cone is the next {INTRADAY_HORIZON_BARS[interval]} {interval} bars")
+        elif cone:
+            bits.append("shaded cone is the live GARCH 70% and 95% band")
+        st.caption(" · ".join(bits))
+
+    _chart_fragment(
+        focus, interval, range_key, compare_sym, show_bench, show_sma, show_bb,
+        show_rsi, show_macd, show_volume, show_marks, rule, show_cone, show_news,
+        show_direction,
+    )
+
+
+def trace_line(s: dict) -> str:
+    """One agent step as a markdown line: what it concluded, what it called."""
+    action = ", ".join(f"`{c}`" for c in s.get("calls", [])) or "done, writing the answer"
+    return f"**Step {s['step']}** · {s.get('thought') or '…'}  \n→ {action}"
 
 
 # ── Tab 2: Ask the Analyst (streaming, follow-up memory) ──
@@ -1694,6 +3101,10 @@ def chat_tab(ticker: str, provider: str, model: str):
     # Render existing history (Streamlit-native chat bubbles)
     for msg in st.session_state.chat_history:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+            if msg.get("trace"):
+                with st.expander(f"Agent: {len(msg['trace'])} steps", expanded=False):
+                    for s in msg["trace"]:
+                        st.markdown(trace_line(s))
             st.markdown(msg["text"])
             if msg["role"] == "agent":
                 tools = ", ".join(msg.get("tools", []))
@@ -1726,9 +3137,13 @@ def chat_tab(ticker: str, provider: str, model: str):
             st.markdown(q_text)
 
         with st.chat_message("assistant"):
-            with st.spinner("Running tools..."):
+            with st.status("Agent working...", expanded=True) as status:
                 prep = prepare_answer(q_text, provider, model,
-                                      history=st.session_state.chat_turns)
+                                      history=st.session_state.chat_turns,
+                                      on_step=lambda s: st.markdown(trace_line(s)))
+                status.update(
+                    label=f"Agent: {len(prep['trace'])} steps · {len(prep['tools_used'])} tool calls",
+                    state="complete", expanded=False)
             streamed = st.write_stream(
                 llm_chat_stream(prep["messages"], provider=provider, model=model)
             )
@@ -1745,7 +3160,7 @@ def chat_tab(ticker: str, provider: str, model: str):
         st.session_state.chat_history.append({"role": "user", "text": q_text})
         st.session_state.chat_history.append({
             "role": "agent", "text": streamed, "tools": prep["tools_used"],
-            "model": mdl, "provider": prov,
+            "trace": prep["trace"], "model": mdl, "provider": prov,
         })
         st.session_state.chat_turns.append({"q": q_text, "a": streamed})
 
@@ -1895,8 +3310,8 @@ def overview_tab():
             | **Data** | `yfinance` — OHLCV history, live quotes, news feed, earnings calendar |
             | **Retrieval** | sentence-transformers embeddings + cosine top-k over the news corpus (RAG) |
             | **Compute** | code-interpreter subprocess — the LLM writes pandas/numpy code, Python executes it |
-            | **LLM** | opencode-free · NVIDIA Build · Groq · kilo-free (OpenAI-compatible endpoints, fallback chain) |
-            | **Agent** | LLM-driven tool selection → execution → synthesis (citations instructed) |
+            | **LLM** | opencode-free · Groq · NVIDIA Build · kilo-free. Models load from each provider's `/models` endpoint; Auto fails over in that order |
+            | **Agent** | observe → decide → act loop, up to 6 steps, then synthesis (citations instructed) |
             | **Sentiment** | LLM JSON scoring with deterministic lexicon fallback |
             | **Risk** | historical vol, VaR, max drawdown, Sharpe (descriptive) |
             | **Technical** | RSI(14), MACD(12,26,9), Bollinger(20,2) — facts only |
@@ -1906,10 +3321,13 @@ def overview_tab():
         st.markdown("#### 🧠 Agent Loop")
         st.markdown(
             """
-            1. **Tool selection** — the LLM reads a tool manifest and chooses
-               what to call (quote, history, RAG, calendar, code execution).
-            2. **Execution** — tools run against live data; `run_analysis`
-               writes Python, the subprocess computes real numbers.
+            1. **Decide** — the LLM reads the tool manifest plus every result
+               so far and picks the next 1–3 calls, or says it has enough.
+            2. **Act** — tools run against live data; `run_analysis` writes
+               Python, the subprocess computes real numbers. Results go back
+               to step 1, so a finding (RSI under 30) can trigger the next
+               check (backtest the RSI-dip rule). Capped at 6 steps / 14
+               calls; repeated calls are refused. Python never picks a tool.
             3. **Retrieval** — `rag_search` embeds the question and returns the
                most relevant dated stories with provider, URL and score.
             4. **Synthesis** — the LLM answers using only tool output, is
@@ -1929,14 +3347,16 @@ def overview_tab():
             """
             | Provider | Endpoint | Models |
             |---|---|---|
-            | **opencode-free** | `opencode.ai/zen/v1` | deepseek-v4-flash-free, mimo-v2.5-free, ling-3.0-flash-free, nemotron-3-ultra-free |
-            | **nvidia-build** | `integrate.api.nvidia.com/v1` | deepseek-v4-flash/pro, **glm-5.2**, nemotron-ultra-253b, minimax-m3 |
-            | **groq** | `api.groq.com/openai/v1` | **gpt-oss-120b**, llama-3.3-70b, llama-3.1-8b, qwen3.6-27b |
+            | **opencode-free** | `opencode.ai/zen/v1` | live `/models`, curated free ids first |
+            | **groq** | `api.groq.com/openai/v1` | live `/models` when `GROQ_API_KEY` is set |
+            | **nvidia-build** | `integrate.api.nvidia.com/v1` | live `/models` when `NVIDIA_API_KEY` is set |
+            | **kilo-free** | `api.kilo.ai/api/openrouter` | live `/models`, Kilo referer headers |
 
-            **Fallback chain:** selected provider → its remaining models →
-            opencode-free → nvidia-build → groq → kilo-free. Empty or
-            rate-limited responses automatically continue down the chain,
-            keeping the app available across vendors.
+            **Failover:** Auto, or the pinned provider first, then opencode-free →
+            groq → nvidia-build → kilo-free. A model chosen from the live list
+            is tried even when it is not in the built-in fallback list. The
+            picker caches `/models` for 10 minutes and uses the built-in list
+            when the endpoint is down.
             """
         )
 
@@ -1974,8 +3394,17 @@ def overview_tab():
             - **RSI(14)** — momentum oscillator; >70 overbought, <30 oversold.
             - **MACD(12,26,9)** — EMA difference vs its 9-period signal line.
             - **Bollinger(20,2)** — 20-day mean ± 2σ band.
+            - **Leading vs lagging** — leading (RSI, stochastic, rate of change,
+              OBV divergence) can turn before price; lagging (50/200-day MA,
+              MACD) confirms a trend once it is under way.
+            - **Relative strength** — stock return minus NIFTY 50 (India) or
+              S&P 500 (US) over 1/3/6 months.
+            - **Backtest** — long-only daily rule, costs per side (Indian STT +
+              stamp duty for NSE/BSE), judged on the first 70% of history and
+              again on the last 30% it never saw, against buy-and-hold.
 
-            *All indicators are computed from live data and shown as facts.*
+            *All indicators are computed from live data and shown as facts.
+            Buy/sell questions get evidence, never a call.*
             """
         )
 
@@ -1984,7 +3413,7 @@ def overview_tab():
     st.markdown(
         """
         ```bash
-        pip install -r requirements.txt   # streamlit, yfinance, pandas, numpy, matplotlib, requests, sentence-transformers
+        pip install -r requirements.txt   # streamlit, yfinance, pandas, numpy, plotly, requests, sentence-transformers
         streamlit run app.py
         ```
         **Streamlit Cloud:** push to GitHub → connect → add provider keys as
@@ -1998,9 +3427,13 @@ def overview_tab():
           attached with provider, date and URL for traceability.
         - Risk metrics use historical data with clearly documented methods.
         - Free LLM tiers are rate-limited; the fallback chain keeps answers
-          flowing across opencode-free, NVIDIA Build, and Groq.
+          flowing across opencode-free, Groq, NVIDIA Build, and Kilo.
         - Uncertainty is quantified as volatility-based ranges, with a standard
           risk disclaimer attached to every forecast-style answer.
+        - Backtests are optimistic in known ways: fills at the signal day's
+          close, only stocks still listed can be tested (survivorship), costs are
+          approximate. A rule that fails here would fail live; one that passes
+          has only cleared the first bar.
         """
     )
 
@@ -2018,6 +3451,7 @@ def overview_tab():
 # MAIN — sidebar drives everything
 # ─────────────────────────────────────────────────────────────
 def main():
+    warm_model_registry()          # cached 10 min; parallel /models fetch
     hero()
     ui = sidebar()
 

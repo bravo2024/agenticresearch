@@ -6,3 +6,4 @@ venv/
 saved_reports/
 .streamlit/secrets.toml
 .DS_Store
+evals/results/
