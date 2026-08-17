@@ -679,9 +679,25 @@ def interval_period(interval: str) -> str:
     return PERIOD_FOR_INTERVAL.get(interval, "2y")
 
 
+def _rate_limited(e: Exception) -> bool:
+    return type(e).__name__ == "YFRateLimitError" or "Too Many Requests" in str(e)
+
+
+def _yf_call(fn, tries: int = 3):
+    """Yahoo throttles shared cloud IPs (Streamlit Cloud) in bursts. Back off
+    and retry instead of failing the first time."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if not _rate_limited(e) or i == tries - 1:
+                raise
+            time.sleep(2 * (i + 1))
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_history(ticker: str, interval: str = "1d", period: str = "2y") -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, interval=interval)
+    df = _yf_call(lambda: yf.Ticker(ticker).history(period=period, interval=interval))
     if getattr(df.index, "tz", None) is not None:
         df.index = df.index.tz_localize(None)
     # NSE sometimes ships today's row with no close yet; one NaN at the end
@@ -772,9 +788,17 @@ def fundamental_facts(ticker: str) -> dict:
     return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in raw.items() if v is not None}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_calendar(ticker: str) -> dict:
-    cal = yf.Ticker(ticker).calendar
+    # Not cached on failure: an empty result from a rate limit would stick for an hour.
+    try:
+        return _calendar(ticker)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _calendar(ticker: str) -> dict:
+    cal = _yf_call(lambda: yf.Ticker(ticker).calendar)
     if not cal:
         return {}
     out = {}
@@ -786,9 +810,17 @@ def get_calendar(ticker: str) -> dict:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def get_news(ticker: str, limit: int = 12) -> list[dict]:
-    news = yf.Ticker(ticker).news or []
+    """Empty list when Yahoo refuses; not cached, so the next run tries again."""
+    try:
+        return _news(ticker, limit)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _news(ticker: str, limit: int) -> list[dict]:
+    news = _yf_call(lambda: yf.Ticker(ticker).news) or []
     items = []
     for n in news[:limit]:
         c = n.get("content", {})
@@ -804,7 +836,6 @@ def get_news(ticker: str, limit: int = 12) -> list[dict]:
     return items
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def get_ticker_news(ticker: str, limit: int = 15) -> list[dict]:
     """Ticker-relevant news only — yfinance's feed is market-wide, so we
     filter by symbol / company-name aliases. Returns the filtered set when
@@ -3474,17 +3505,31 @@ def main():
     ])
 
     with tabs[0]:
-        price_chart_tab(ticker, interval, ui["auto_refresh"])
+        guarded(price_chart_tab, ticker, interval, ui["auto_refresh"])
     with tabs[1]:
-        chat_tab(ticker, provider, model)
+        guarded(chat_tab, ticker, provider, model)
     with tabs[2]:
-        sentiment_tab(ticker, ui["lookback"], provider, model)
+        guarded(sentiment_tab, ticker, ui["lookback"], provider, model)
     with tabs[3]:
-        risk_tech_tab(ticker)
+        guarded(risk_tech_tab, ticker)
     with tabs[4]:
-        data_tab(ticker, interval)
+        guarded(data_tab, ticker, interval)
     with tabs[5]:
-        overview_tab()
+        guarded(overview_tab)
+
+
+def guarded(tab_fn, *args):
+    """One tab failing (usually Yahoo throttling) must not take the page down."""
+    try:
+        tab_fn(*args)
+    except Exception as e:
+        if type(e).__name__ in ("RerunException", "StopException"):
+            raise
+        if _rate_limited(e):
+            st.warning("Yahoo Finance is rate-limiting this server right now. "
+                       "Wait a minute and press Run again.")
+        else:
+            st.error(f"This tab hit an error: {type(e).__name__}. The other tabs still work.")
 
 
 if __name__ == "__main__":
