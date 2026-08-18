@@ -1,82 +1,86 @@
-# Real-Time Market Intelligence Assistant
+# Real-Time Market Research Assistant
 
-**Powered by :::** yfinance · pandas · NumPy · sentence-transformers (RAG) · arch (GARCH) · frontier LLMs (opencode-free · NVIDIA Build · Groq · kilo-free)
+A tool-using LLM agent for market questions. Ask in plain language ("what is driving NVDA today?", "BTC-USD vs gold volatility", "has Maruti Suzuki beaten the Indian market?") and the agent picks tools step by step, pulls live data from Yahoo Finance, runs the numbers in Python and answers only from what the tools returned.
 
-An agentic market analyst. Give it a question in plain English — "what's driving NVDA today?", "BTC-USD vs gold volatility?", "crude & Reliance correlation?" — and it takes it from there: resolves every symbol named, pulls live quotes, history, news, and fundamentals from yfinance, runs the numbers, and answers with sources.
+Live app: https://agenticresearch.streamlit.app
 
-## What it does well
+## How it works
 
-- **Any asset, by any name.** The agent resolves what you actually said — tickers, company names, colloquial handles ("crude", "gold", "S&P 500") — and routes to the right symbol automatically. One question can span multiple assets at once, cross-currency and cross-market (US, India, crypto, commodities, indices).
-- **Works in steps, like an analyst.** Each turn the model reads every result so far and picks the next tool, or stops. RSI under 30 leads it to backtest the RSI-dip rule; a backtest with too few trades leads it to retry on a longer window. Up to 6 steps, repeated calls refused, and every step is shown in the chat so you can see why it did what it did.
-- **Answers from data, not memory.** The model decides the analysis; Python does the arithmetic. Analysis code is executed in a code-interpreter subprocess with the app's live data injected, and a repair loop self-corrects failing scripts. Every figure returned is a real, computed number.
-- **Live news + true RAG.** Headlines are embedded with `sentence-transformers` and retrieved by cosine similarity across the news corpus and peer tickers — every story carries provider, date, and URL, so the agent's claims come with receipts.
-- **Multilingual.** Ask in Hindi, English, or any language — the analyst answers in the same language, figures and all.
-- **Resilient by design.** Four providers — opencode-free, NVIDIA Build, Groq, kilo-free — with automatic cross-provider fallback and per-model retries. Two run keyless; set one optional key and the answer always gets through.
+- **Any Yahoo Finance symbol.** Tickers, company names and common names ("crude", "gold", "S&P 500") resolve to symbols, through a built-in alias list first and Yahoo search second. Indian names prefer the NSE listing. One question can cover several assets across the US, India, crypto, commodities and indices.
+- **Agent loop.** Each step the LLM reads every result so far and picks the next one to three tool calls, or stops. A finding can trigger the next check: RSI under 30 leads to a backtest of the RSI-dip rule. Limit of 6 steps and 14 calls; repeated calls are refused. Every step is shown in the chat.
+- **Numbers come from code.** The LLM decides what to analyse; Python computes it. Free-form analysis runs as model-written pandas code in a subprocess, with up to two repair attempts if it fails.
+- **News retrieval.** Headlines are embedded with `all-MiniLM-L6-v2` and retrieved by cosine similarity, across peer tickers for sector questions. Each story carries provider, date and URL.
+- **Provider failover.** Groq, Gemini (free tier), NVIDIA, Kilo and opencode, in that order. Providers without a key are skipped; Kilo and opencode work without one.
 
-## Tools the agent can call
+## Agent tools
 
-| Tool | What it returns |
+| Tool | Returns |
 |---|---|
-| `get_quote` | Live price and day change, computed from previous close |
-| `get_history` | OHLCV over a chosen interval |
-| `rag_search` | Semantically retrieved headlines with source and date |
-| `get_ticker_news` | Recent headlines relevant to the ticker |
-| `technical_facts` | RSI, MACD, Bollinger, SMA/EMA crossovers, momentum flags |
+| `get_quote` | Live price and day change |
+| `get_history` | OHLCV for a chosen interval |
 | `fundamental_facts` | Valuation, margins, growth, beta, analyst targets, dividend yield |
-| `pair_correlation` | Aligned correlation, beta, and covariance between any two assets; with `lag`, which one moves first |
-| `indicators` | Leading (RSI, stochastic, rate of change, OBV divergence), lagging (50/200-day MAs, MACD), volatility (ATR, Bollinger squeeze) and relative strength vs NIFTY 50 / S&P 500 |
-| `backtest_rule` | Has this setup actually paid on this stock? RSI dip, MA cross, breakout or MACD rule, after costs, in-sample vs out-of-sample |
-| `run_analysis` | Model-written Python, executed in a subprocess with full data |
-
-## Methods, briefly
-
-- **Risk & technical.** Volatility, VaR95, max drawdown, Sharpe, RSI, MACD, Bollinger bands — all computed from live history.
-- **Forecasts.** `forecast_range()` fits a GARCH(1,1) variance model with `arch` and returns 70%/95% volatility-based price bands — an honest range, not a coin-flip direction call.
-- **Sentiment.** Per-headline LLM scoring with a lexicon fallback, aggregated and plotted.
-- **News retrieval.** Cosine top-k over sentence embeddings — sector questions extend the corpus across peer tickers.
-- **Correlations.** Deterministic pandas alignment of any two assets, with betas computed in both directions.
+| `technical_facts` | RSI(14), MACD and signal, Bollinger band |
+| `indicators` | Leading (RSI, stochastic, rate of change, OBV divergence), lagging (50/200-day MA, MACD), volatility (ATR, Bollinger squeeze), relative strength vs NIFTY 50 or S&P 500 |
+| `risk_metrics` | Volatility, VaR 95%, max drawdown, Sharpe |
+| `forecast_range` | GARCH(1,1) 70% and 95% price ranges |
+| `pair_correlation` | Correlation, beta and covariance between two assets; with `lag`, which one moves first |
+| `backtest_rule` | RSI dip, MA cross, breakout or MACD rule after costs, in-sample vs out-of-sample |
+| `verdict` | Tested direction for one rule (long, flat or no edge) with volatility ranges |
+| `rag_search` | Most relevant headlines for the question |
+| `get_ticker_news` | Recent headlines for the ticker |
+| `run_analysis` | Model-written Python run on the full data |
+| `chart_spec` | Chart settings for the price tab |
 
 ## Evidence, not calls
 
-Ask "should I buy Bajaj Finance?" and the analyst won't say buy or sell. It
-shows what the leading and lagging indicators read today, then tests whether
-that setup has made money on that stock before:
+Asked "should I buy Bajaj Finance?", the agent does not say buy or sell. It reports what the indicators read today and tests whether that setup has made money on that stock:
 
-- Long-only daily rules, costs charged on every entry and exit. For NSE/BSE
-  that means STT on both sides, stamp duty on the buy and a little slippage
-  (about 0.3% round trip); US stocks get spread and slippage only.
-- History is split 70/30 by date. The first part is where you'd have found
-  the idea, the last part is what it never saw. Both are compared with
-  buy-and-hold and with the index over the same dates.
-- The verdict is blunt: held up, didn't survive out of sample, no edge after
-  costs, or too few trades to say.
+- Long-only daily rules with costs on every entry and exit: STT on both sides, stamp duty on the buy and slippage for NSE/BSE (about 0.3% round trip); spread and slippage for US stocks.
+- History is split 70/30 by date and both parts are compared with buy-and-hold and the index over the same dates.
+- The result is one of: held up, failed out of sample, no edge after costs, or too few trades.
 
-Known limits: fills are assumed at the signal day's close, only stocks still
-listed can be tested, and the cost table is an approximation (STT changes
-with the budget). Renamed or demerged companies need their new name.
+Limits: fills at the signal day's close, only currently listed stocks, approximate costs. Renamed or demerged companies need their current name.
 
-Any equity works by name. "Hindustan Aeronautics" resolves to `HAL.NS`
-through Yahoo's search, with the NSE listing preferred over BSE.
+## Evaluation
 
-## Run it
+`evals/` holds 22 questions (18 development, 4 held out) with checks on which tools the agent must call, whether every number in the answer appears in tool output, and whether it avoids buy/sell advice. Each run uses live market data and live LLMs, so results vary. The figures below are 3 repeats of every case (66 runs) with automatic failover across Groq, Gemini and NVIDIA; most answers came from Nemotron-3-Super-120B.
+
+| Metric | Result |
+|---|---|
+| Tasks passing all 3 runs (pass^3) | 86% (19/22) |
+| Task success per run | 94% (62/66) |
+| Held-out task success per run | 100% (12/12) |
+| Required tools called | 97% (67/69 checks) |
+| Numbers grounded in tool output | 97% |
+| Buy/sell advice given | 0 |
+| Mean agent steps / tool calls | 3.0 / 2.5 |
+
+```bash
+python evals/run_evals.py --repeats 3
+```
+
+## Run locally
 
 ```bash
 pip install -r requirements.txt
-python app.py
+streamlit run app.py
 ```
 
-The first run downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) for news retrieval.
-
-Set one or more provider keys as environment variables (or cloud secrets) and the chain uses them automatically:
+The first run downloads the embedding model (about 90 MB). Provider keys are optional and are read from Streamlit secrets, environment variables or a `.env` file next to `app.py`:
 
 ```
-OPENCODE_ZEN_API_KEY = "..."
-NVIDIA_API_KEY       = "..."
-GROQ_API_KEY         = "..."
+GROQ_API_KEY=...
+NVIDIA_API_KEY=...
+GEMINI_API_KEY=...
 ```
 
-No keys are required — opencode-free and kilo-free run keyless.
+## Tests
 
----
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
-**Disclaimer.** This is an educational research tool, not investment advice. Forecasts are probabilistic estimates based on historical volatility; markets can move beyond any range. Do your own research before any financial decision.
+Tests run offline with synthetic prices and scripted LLM replies.
+
+Not investment advice. Ranges are estimates from historical volatility and prices can move outside them.

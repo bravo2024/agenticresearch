@@ -209,3 +209,11 @@ def test_chart_spec_keeps_known_layers_only():
     assert spec["panels"] == ["rsi", "volume"]
     assert spec["marks"] == "backtest"
     assert spec["rule"] == "ma_cross"
+
+
+def test_gemini_ranks_newest_flash_first():
+    ids = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite",
+           "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    assert app._rank_models("gemini-free", ids) == [
+        "gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash",
+        "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]

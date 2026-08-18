@@ -1,21 +1,18 @@
 """
-Real-Time Market Research Assistant — Agentic Edition
-======================================================
-Vivek's original style: wide layout, light theme, sidebar-driven tabs,
-price chart up front. A complete real-time market research tool: live
-market data, RAG retrieval over news, real computed analytics, and an
-LLM agent (opencode-free / nvidia-build / groq) that answers with
-evidence.
+Real-Time Market Research Assistant
 
-Tabs (all driven by the LEFT SIDEBAR — no per-tab inputs):
-  1. 📈 Price Chart     — line or candlestick, MA20/50, volume, auto-refresh
-  2. 💬 Ask the Analyst — LLM agent with follow-up memory + suggested questions
-  3. 🧭 Sentiment       — every headline scored, daily series, summaries
-  4. 🛡 Risk & Technical— vol/VaR/drawdown/Sharpe + RSI/MACD/Bollinger
-  5. 📊 Raw Data + News — history table, CSV download, expandable headlines
-  6. 📄 Project Overview— architecture, stack, methodology, coverage notes
+Live market data, news retrieval, computed risk and technical analytics, and a
+tool-using LLM agent that answers from that data.
 
-Portfolio Edition · CPU-only · Streamlit Cloud ready
+Tabs (all driven by the sidebar):
+  1. Price Chart: line or candlestick, moving averages, volume, auto-refresh
+  2. Ask the Analyst: LLM agent with follow-up memory and suggested questions
+  3. Sentiment: every headline scored, daily series, summaries
+  4. Risk & Technical: volatility, VaR, drawdown, Sharpe, RSI, MACD, Bollinger
+  5. Raw Data + News: history table, CSV download, headlines
+  6. About: architecture, providers, methods, limitations
+
+Runs on CPU.
 """
 
 import json
@@ -50,7 +47,7 @@ from plotly.subplots import make_subplots
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Real-Time Market Research Assistant by Vivek Bose",
-    page_icon="📡",
+    page_icon=":material/monitoring:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -144,6 +141,9 @@ LLM_PROVIDERS = {
             "gemini-2.5-flash-lite",
         ],
         "tag": "gemini",
+        # Live discovery decides: newest Flash first. The list above is only
+        # the fallback when /models cannot be reached.
+        "prefer_newest": True,
     },
     "kilo-free": {
         "base": "https://api.kilo.ai/api/openrouter",
@@ -246,6 +246,63 @@ def resolve_tickers(text: str) -> list[str]:
     return found
 
 
+_NAME_STOPWORDS = {
+    "a", "an", "and", "are", "can", "could", "did", "do", "does", "for", "has",
+    "have", "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or",
+    "should", "show", "tell", "the", "to", "vs", "was", "what", "when", "where",
+    "which", "who", "why", "will", "with", "would",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _search_name(name: str) -> str:
+    """Yahoo search for a company name. Returns a symbol only when the listed
+    company name starts with the searched words, otherwise ""."""
+    try:
+        quotes = yf.Search(name, max_results=8).quotes or []
+    except Exception:
+        return ""
+    words = name.lower().split()
+    hits = []
+    for q in quotes:
+        sym = q.get("symbol", "")
+        label = (q.get("longname") or q.get("shortname") or "").lower()
+        if q.get("quoteType") not in ("EQUITY", "ETF") or not sym:
+            continue
+        if label.split()[:len(words)] == words or label.startswith(name.lower()):
+            hits.append(sym)
+    for suffix in (".NS", ".BO"):
+        for h in hits:
+            if h.endswith(suffix):
+                return h
+    return hits[0] if hits else ""
+
+
+def resolve_names(text: str, limit: int = 3) -> list[str]:
+    """Tickers for capitalized company names in free text that the alias list
+    does not know. Multi-word names are tried before single words."""
+    runs, cur = [], []
+    for tok in re.findall(r"[A-Za-z][A-Za-z&.'-]*", text):
+        if tok[0].isupper() and tok.lower() not in _NAME_STOPWORDS:
+            cur.append(tok)
+        elif cur:
+            runs.append(" ".join(cur))
+            cur = []
+    if cur:
+        runs.append(" ".join(cur))
+    runs = sorted(dict.fromkeys(runs), key=lambda r: -len(r.split()))
+    found = []
+    for r in runs:
+        if len(found) >= limit:
+            break
+        if found and len(r.split()) == 1:
+            break  # a multi-word name already matched; single words add noise
+        sym = _search_name(r)
+        if sym and sym not in found:
+            found.append(sym)
+    return found
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def normalize_ticker(raw: str) -> str:
     """Turn whatever the agent wrote ("Tata Motors", "TATAMOTORS", "AMD") into
@@ -326,7 +383,7 @@ def get_key(env_name: str) -> str:
     if not key:
         key = os.environ.get(env_name, "")
     if not key:
-        env_path = Path.home() / ".hermes" / ".env"
+        env_path = Path(__file__).resolve().parent / ".env"
         if env_path.exists():
             for line in env_path.read_text().splitlines():
                 if line.startswith(f"{env_name}="):
@@ -462,6 +519,15 @@ def _rank_models(pname: str, ids: list[str]) -> list[str]:
             if i not in seen and rx.search(i):
                 ranked.append(i)
                 seen.add(i)
+    if cfg.get("prefer_newest"):
+        # Within each family keep newest versions first: gemini-3.8-flash
+        # before gemini-3.5-flash before gemini-2.5-flash.
+        def version(m):
+            v = re.search(r"(\d+(?:\.\d+)?)", m)
+            return float(v.group(1)) if v else 0.0
+        fam = lambda m: next((k for k, pat in enumerate(MODEL_RANK.get(pname, []))
+                              if re.search(pat, m, re.I)), 99)
+        ranked.sort(key=lambda m: (fam(m), -version(m)))
     return ranked
 
 
@@ -474,7 +540,7 @@ def available_models(provider: str, free_only: bool = True) -> list[str]:
     discovered = discover_models(provider)
     if not discovered:
         return static
-    curated = [m for m in static if m in discovered and _allowed(provider, m)]
+    curated = [] if cfg.get("prefer_newest") else         [m for m in static if m in discovered and _allowed(provider, m)]
     ranked = _rank_models(provider, discovered)
     if free_only:
         ranked = [m for m in ranked if "free" in m.lower()] or ranked
@@ -509,7 +575,7 @@ def _models_for(pname: str) -> list[str]:
     hit = _MODELS_CACHE.get(pname)
     if hit and time.time() - hit[0] < _MODELS_TTL:
         live = set(hit[1])
-        models = [m for m in cfg["models"] if m in live]
+        models = [] if cfg.get("prefer_newest") else [m for m in cfg["models"] if m in live]
         models += [m for m in _rank_models(pname, hit[1]) if m not in models]
     else:
         models = list(cfg["models"])
@@ -606,6 +672,34 @@ def llm_chat(messages: list[dict], temperature: float = 0.2,
                 break                      # bad key: skip the rest of this provider
 
     return {"ok": False, "error": "; ".join(errors[-8:])}
+
+
+_CITE_RE = re.compile(r"\u3010[^\u3011]*\u3011")
+
+
+def clean_answer(text: str) -> str:
+    """Strip tool-citation markers some models emit and normalize dashes."""
+    text = _CITE_RE.sub("", text or "")
+    text = text.replace("\u2011", "-").replace("\u2010", "-")
+    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
+    text = re.sub(r"(?<=\S) {2,}(?=\S)", " ", text)
+    return re.sub(r"[ \t]+([.,;:])", r"\1", text)
+
+
+def clean_stream(chunks):
+    """clean_answer for a token stream: holds text back while a citation
+    marker is still open so it never reaches the screen."""
+    buf = ""
+    for c in chunks:
+        buf += c
+        if "\u3010" in buf and "\u3011" not in buf[buf.rfind("\u3010"):]:
+            continue
+        out = clean_answer(buf)
+        buf = ""
+        if out:
+            yield out
+    if buf:
+        yield clean_answer(buf)
 
 
 def llm_chat_stream(messages: list[dict], temperature: float = 0.2,
@@ -2121,7 +2215,7 @@ SUGGESTED_QUESTIONS = [
     "Market mood on TSLA?",
     "MSFT technicals: RSI, MACD, Bollinger",
     "BTC-USD: earnings + risk snapshot",
-    "NVDA vs AMD: volatility face-off",
+    "NVDA vs AMD: which is more volatile?",
     "Bajaj Finance looks oversold. Has buying RSI dips actually worked on it?",
     "HDFC Bank: leading vs lagging indicators, and how is it doing against NIFTY?",
     "Does crude oil lead the Indian rupee? Check a 5-day lag",
@@ -2445,7 +2539,7 @@ def prepare_answer(question: str, provider: str = "", model: str = "",
     gathers evidence step by step → build the synthesis context. Returns the
     messages to stream plus the trace for the UI.
     """
-    tickers = resolve_tickers(question)
+    tickers = list(dict.fromkeys(resolve_tickers(question) + resolve_names(question)))
     selected = st.session_state.get("_sidebar_ticker", "AAPL") or "AAPL"
 
     results, trace = agent_loop(question, tickers, selected, provider, model, on_step)
@@ -2494,9 +2588,13 @@ def prepare_answer(question: str, provider: str = "", model: str = "",
         "recommend a ticker whose data is absent, and cite each candidate's "
         "price and valuation from the tool output.\n"
         "11. If the user asked which way a symbol is leaning and verdict is missing, "
-        "say the tested direction was not computed. Do not fill the gap from memory.\n\n"
+        "say the tested direction was not computed. Do not fill the gap from memory.\n"
+        "12. Style: start with the answer. No greeting, no restating the question, "
+        "no closing offer to help. Plain sentences and short bullet lists. No emojis, "
+        "no em dashes, no filler such as 'delve', 'robust', 'it is important to note', "
+        "'in conclusion', 'overall'. Bold only the key numbers.\n\n"
         "STANDARD WARNING (append verbatim to any forecast):\n"
-        "\"⚠️ This is not investment advice. Forecasts are probabilistic "
+        "\"Not investment advice. Forecasts are probabilistic "
         "estimates based on historical volatility; markets can move beyond any "
         "range. Do your own research before making any financial decision.\""
     )
@@ -2532,7 +2630,7 @@ def answer_question(question: str, provider: str = "", model: str = "",
     prep = prepare_answer(question, provider, model, history)
     resp = llm_chat(prep["messages"], provider=provider, model=model)
     return {
-        "answer": resp.get("text", f"LLM error: {resp.get('error', '?')}"),
+        "answer": clean_answer(resp["text"]) if resp.get("text") else f"LLM error: {resp.get('error', '?')}",
         "ticker": prep["ticker"],
         "tools_used": prep["tools_used"],
         "results": prep["results"],
@@ -2558,11 +2656,10 @@ def link_html(url: str, text: str | None = None) -> str:
 
 
 def render_story_card(s: dict, show_summary: bool = False):
-    icon = "🟢" if s["score"] > 0.3 else ("🔴" if s["score"] < -0.3 else "⚪")
     meta = f'{s["provider"]} · {s["date"]}'
     link = link_html(s.get("url", ""), "Read full story ↗")
     html = (
-        f'<div class="card"><small>{icon} <b>{s["title"]}</b> '
+        f'<div class="card"><small><b>{s["title"]}</b> '
         f'<span class="tag tag-gold">{s["score"]:+.1f}</span></small><br>'
         f'<small style="color:#777;">{meta} · {link}</small>'
     )
@@ -2576,8 +2673,8 @@ def hero():
     st.markdown(
         """
         <div class="hero">
-            <h1>📡 Real-Time Market Research Assistant</h1>
-            <p>Live quotes · headline sentiment · risk analytics · technical indicators · RAG retrieval · LLM analysis</p>
+            <h1>Real-Time Market Research Assistant</h1>
+            <p>Live quotes, news sentiment, risk and technical analytics, and an LLM agent that answers from the data.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2586,28 +2683,28 @@ def hero():
 
 def sidebar():
     with st.sidebar:
-        st.markdown("### 📈 Asset Symbol Options")
+        st.markdown("### Symbol")
 
-        ticker_input = st.text_input("Type your ticker (overrides dropdown if filled):", "AAPL").upper()
+        ticker_input = st.text_input("Ticker", "AAPL", help="Any Yahoo Finance symbol. Overrides the list below.").upper()
         ticker_options = [ticker_input] + [t for t in TICKERS if t != ticker_input]
-        ticker_symbol = st.selectbox("Or select any ticker from list:", ticker_options, index=0)
+        ticker_symbol = st.selectbox("Or pick from the list", ticker_options, index=0)
         st.session_state["_sidebar_ticker"] = ticker_symbol
 
         st.markdown('<small style="color:#555; font-weight:600;">Quick picks</small>', unsafe_allow_html=True)
         wcols = st.columns(4)
         for i, w in enumerate(WATCHLIST):
             with wcols[i % 4]:
-                if st.button(w, key=f"w_{w}", use_container_width=True):
+                if st.button(w, key=f"w_{w}", width="stretch"):
                     ticker_symbol = w
                     st.session_state["_sidebar_ticker"] = w
 
         interval_options = ['1d', '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '5d', '1wk', '1mo', '3mo']
-        selected_interval = st.selectbox("Select Time Interval:", interval_options, index=0)
+        selected_interval = st.selectbox("Interval", interval_options, index=0)
 
-        lookback_days = st.slider("Sentiment Lookback (days)", 1, 30, 7)
+        lookback_days = st.slider("Sentiment lookback (days)", 1, 30, 7)
 
         st.markdown("---")
-        st.markdown("### 🤖 LLM Provider")
+        st.markdown("### LLM provider")
         provider_choice = st.selectbox(
             "Provider:",
             ["Auto (failover)"] + LLM_PROVIDER_ORDER,
@@ -2621,7 +2718,7 @@ def sidebar():
                 first = f" · first: `{row['first']}`" if row["first"] else ""
                 st.markdown(f"**{row['provider']}** · {row['key']} · {live}{first}")
             st.caption("Keys are read from Streamlit secrets, environment variables, "
-                       "or ~/.hermes/.env. Groq and NVIDIA keys are free to create.")
+                       "or a local .env file. Groq, Gemini and NVIDIA keys are free to create.")
         if provider_choice == "Auto (failover)":
             provider, model_choice = "", ""
             st.caption("Models are chosen per call from the live failover chain.")
@@ -2634,15 +2731,15 @@ def sidebar():
                      "Falls back to the built-in list if the endpoint is unreachable.",
             )
 
-        auto_refresh = st.checkbox("🔄 Auto-refresh price chart (60s)", value=False)
+        auto_refresh = st.checkbox("Auto-refresh price chart (60s)", value=False)
 
         st.markdown("---")
-        run = st.button("▶️ Run / Refresh All Tabs", type="primary", use_container_width=True)
+        run = st.button("Refresh all tabs", type="primary", width="stretch")
 
         st.markdown("---")
         st.markdown(
-            '<small style="color:#888;">Facts, sources, and quantified uncertainty — '
-            'every figure computed from live data.<br>Groq · Gemini · NVIDIA · Kilo · opencode, models loaded live</small>',
+            '<small style="color:#888;">Data from Yahoo Finance. LLMs via Groq, Gemini, '
+            'NVIDIA, Kilo and opencode.</small>',
             unsafe_allow_html=True,
         )
         return {
@@ -2932,7 +3029,7 @@ def price_chart_tab(ticker: str, interval: str, auto_refresh: bool):
     _apply_chart_spec(spec)
     focus = st.session_state.get("chart_focus") or ticker
 
-    st.markdown(f"### 📈 {focus}")
+    st.markdown(f"### {focus}")
     bench = benchmark_for(focus)
     st.caption(
         f"{market_of(focus)} · benchmark {bench or 'none'} · interval {interval} · "
@@ -2949,7 +3046,7 @@ def price_chart_tab(ticker: str, interval: str, auto_refresh: bool):
             f"{price:,.2f}" if price else "—",
             delta=f"{chg:.2f}%" if chg is not None else None,
         )
-        if tape_cols[i].button(sym, key=f"tape_{sym}", use_container_width=True):
+        if tape_cols[i].button(sym, key=f"tape_{sym}", width="stretch"):
             st.session_state["chart_focus"] = sym
             st.rerun()
 
@@ -3084,7 +3181,7 @@ def price_chart_tab(ticker: str, interval: str, auto_refresh: bool):
         if fig is None:
             st.warning(f"No chart for {focus}.")
             return
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         if card and card.get("error"):
             st.caption(card["error"])
         elif card:
@@ -3122,7 +3219,7 @@ def trace_line(s: dict) -> str:
 
 # ── Tab 2: Ask the Analyst (streaming, follow-up memory) ──
 def chat_tab(ticker: str, provider: str, model: str):
-    st.markdown("### 💬 Ask the Analyst")
+    st.markdown("### Ask the Analyst")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -3140,7 +3237,7 @@ def chat_tab(ticker: str, provider: str, model: str):
             if msg["role"] == "agent":
                 tools = ", ".join(msg.get("tools", []))
                 st.markdown(
-                    f'<small style="color:#7B2D8E;">🤖 <b>{msg.get("model","?")}</b> · '
+                    f'<small style="color:#7B2D8E;"><b>{msg.get("model","?")}</b> · '
                     f'{msg.get("provider","?")} · tools: {tools}</small>',
                     unsafe_allow_html=True,
                 )
@@ -3154,7 +3251,7 @@ def chat_tab(ticker: str, provider: str, model: str):
     pending = None
     for i, sq in enumerate(SUGGESTED_QUESTIONS):
         with sug_cols[i % 3]:
-            if st.button(f"💡 {sq}", key=f"sug_{i}", use_container_width=True):
+            if st.button(sq, key=f"sug_{i}", width="stretch"):
                 pending = sq
 
     # st.chat_input: submit-once semantics — no reload loop, clears after send
@@ -3176,14 +3273,14 @@ def chat_tab(ticker: str, provider: str, model: str):
                     label=f"Agent: {len(prep['trace'])} steps · {len(prep['tools_used'])} tool calls",
                     state="complete", expanded=False)
             streamed = st.write_stream(
-                llm_chat_stream(prep["messages"], provider=provider, model=model)
+                clean_stream(llm_chat_stream(prep["messages"], provider=provider, model=model))
             )
             prov = st.session_state.get("_llm_provider", provider)
             mdl = st.session_state.get("_llm_model", model)
             tools = ", ".join(prep["tools_used"])
             tickers = ", ".join(prep.get("tickers", [])) or prep["ticker"]
             st.markdown(
-                f'<small style="color:#7B2D8E;">🤖 <b>{mdl}</b> · {prov} · '
+                f'<small style="color:#7B2D8E;"><b>{mdl}</b> · {prov} · '
                 f'tickers: {tickers} · tools: {tools}</small>',
                 unsafe_allow_html=True,
             )
@@ -3196,18 +3293,18 @@ def chat_tab(ticker: str, provider: str, model: str):
         st.session_state.chat_turns.append({"q": q_text, "a": streamed})
 
     if st.session_state.chat_history:
-        if st.button("🗑 Clear conversation"):
+        if st.button("Clear conversation"):
             st.session_state.chat_history = []
             st.session_state.chat_turns = []
             st.rerun()
 
     st.markdown("---")
-    st.caption("Computed from live data · Informational, not investment advice.")
+    st.caption("For information only. Not investment advice.")
 
 
 # ── Tab 3: Sentiment (full story list) ──
 def sentiment_tab(ticker: str, lookback: int, provider: str, model: str):
-    st.markdown(f"### 🧭 Sentiment — {ticker}")
+    st.markdown(f"### Sentiment: {ticker}")
     st.caption(f"lookback: {lookback} days (sidebar slider) · scored by {provider}/{model}")
 
     with st.spinner(f"Scoring headlines with the LLM ({provider})..."):
@@ -3237,8 +3334,8 @@ def sentiment_tab(ticker: str, lookback: int, provider: str, model: str):
 
 # ── Tab 4: Risk & Technical ──
 def risk_tech_tab(ticker: str):
-    st.markdown(f"### 🛡 Risk & 📐 Technical — {ticker}")
-    st.caption("Descriptive analytics — historical figures, volatility-based ranges, and indicator facts")
+    st.markdown(f"### Risk and technicals: {ticker}")
+    st.caption("Historical figures and current indicator values.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -3270,7 +3367,7 @@ def risk_tech_tab(ticker: str):
 
     cal = get_calendar(ticker)
     if cal:
-        st.markdown("**📅 Upcoming events**")
+        st.markdown("**Upcoming events**")
         for k, v in cal.items():
             if v:
                 st.markdown(f"- {k}: **{v}**")
@@ -3278,7 +3375,7 @@ def risk_tech_tab(ticker: str):
 
 # ── Tab 5: Raw Data + News ──
 def data_tab(ticker: str, interval: str):
-    st.markdown(f"### 📊 Raw Data — {ticker} ({interval})")
+    st.markdown(f"### Raw data: {ticker} ({interval})")
     st.caption(f"data as of {fresh_stamp()}")
     df = get_history(ticker, interval, interval_period(interval))
     if df.empty:
@@ -3287,14 +3384,14 @@ def data_tab(ticker: str, interval: str):
 
     st.dataframe(df.tail(100), width="stretch")
     st.download_button(
-        "⬇️ Download CSV",
+        "Download CSV",
         df.to_csv(),
         file_name=f"{ticker}_{interval}.csv",
         mime="text/csv",
     )
 
     st.markdown("---")
-    st.markdown("### 📰 Latest Headlines")
+    st.markdown("### Latest headlines")
     news = get_news(ticker, limit=10)
     if not news:
         st.info("No recent news.")
@@ -3309,173 +3406,107 @@ def data_tab(ticker: str, interval: str):
         )
 
 
-# ── Tab 6: Project Overview (technical documentation) ──
+# ── Tab 6: About ──
 def overview_tab():
-    st.markdown("### 📄 Project Overview & Technical Documentation")
-
+    st.markdown("### About")
     st.markdown(
-        '<div class="card">'
-        '<span class="metric-label">Project Overview</span><br>'
-        '<span style="color:#555;">A single-file market research workstation that combines '
-        'live quotes, OHLCV charting, headline sentiment, risk analytics, technical '
-        'indicators, semantic news retrieval (RAG), and a tool-using LLM agent. Every '
-        'figure is computed from live data; every answer carries sources and quantified '
-        'uncertainty.</span>'
-        '</div>',
-        unsafe_allow_html=True,
+        "A market research assistant built on live Yahoo Finance data. An LLM agent "
+        "picks tools step by step (quotes, history, fundamentals, indicators, "
+        "correlation, backtests, risk, news retrieval, Python analysis) and answers "
+        "only from what those tools return."
     )
 
     stat_a, stat_b, stat_c, stat_d = st.columns(4)
-    stat_a.metric("Tickers tracked", len(TICKERS))
+    stat_a.metric("Tickers listed", len(TICKERS))
     stat_b.metric("LLM providers", len(LLM_PROVIDERS))
     stat_c.metric("Agent tools", len(AGENT_TOOL_MANIFEST))
     stat_d.metric("Tabs", 6)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("#### 🏗 Architecture")
+        st.markdown("#### Architecture")
         st.markdown(
             """
             | Layer | Component |
             |---|---|
-            | **Data** | `yfinance` — OHLCV history, live quotes, news feed, earnings calendar |
-            | **Retrieval** | sentence-transformers embeddings + cosine top-k over the news corpus (RAG) |
-            | **Compute** | code-interpreter subprocess — the LLM writes pandas/numpy code, Python executes it |
-            | **LLM** | opencode-free · Groq · NVIDIA Build · kilo-free. Models load from each provider's `/models` endpoint; Auto fails over in that order |
-            | **Agent** | observe → decide → act loop, up to 6 steps, then synthesis (citations instructed) |
-            | **Sentiment** | LLM JSON scoring with deterministic lexicon fallback |
-            | **Risk** | historical vol, VaR, max drawdown, Sharpe (descriptive) |
-            | **Technical** | RSI(14), MACD(12,26,9), Bollinger(20,2) — facts only |
-            | **UI** | Streamlit · wide layout · sidebar is the single source of truth |
+            | Data | `yfinance`: price history, quotes, news, earnings calendar |
+            | Retrieval | `all-MiniLM-L6-v2` embeddings, cosine top-k over news |
+            | Compute | The LLM writes pandas/NumPy code; a subprocess runs it |
+            | Agent | Decide, call tools, read results; up to 6 steps, then answer |
+            | Sentiment | LLM scores each headline as JSON; lexicon fallback |
+            | Risk | Volatility, VaR, max drawdown, Sharpe |
+            | Technical | RSI(14), MACD(12,26,9), Bollinger(20,2) |
             """
         )
-        st.markdown("#### 🧠 Agent Loop")
+        st.markdown("#### Agent loop")
         st.markdown(
             """
-            1. **Decide** — the LLM reads the tool manifest plus every result
-               so far and picks the next 1–3 calls, or says it has enough.
-            2. **Act** — tools run against live data; `run_analysis` writes
-               Python, the subprocess computes real numbers. Results go back
-               to step 1, so a finding (RSI under 30) can trigger the next
-               check (backtest the RSI-dip rule). Capped at 6 steps / 14
-               calls; repeated calls are refused. Python never picks a tool.
-            3. **Retrieval** — `rag_search` embeds the question and returns the
-               most relevant dated stories with provider, URL and score.
-            4. **Synthesis** — the LLM answers using only tool output, is
-               instructed to cite the retrieved sources (attached with
-               provider, date and URL), and attaches the standard warning to
-               any forecast.
-            5. **Repair loop** — if generated code fails, the error is returned
-               to the LLM for up to two correction attempts.
+            1. The LLM reads the tool list and all results so far, then picks the
+               next one to three calls or stops.
+            2. Tools run on live data. A finding can trigger the next check, for
+               example RSI under 30 leads to a backtest of the RSI-dip rule.
+               Limit: 6 steps, 14 calls, no repeated calls.
+            3. The answer uses only tool output and cites news by provider and date.
+            4. If generated analysis code fails, the error goes back to the LLM
+               for up to two fixes.
 
-            *Note: generated code executes locally as the app user with
-            normal filesystem/network access — do not deploy unauthenticated.*
+            Analysis code runs locally with normal file and network access, so
+            do not deploy this without authentication.
             """
         )
     with c2:
-        st.markdown("#### 🤖 LLM Providers")
+        st.markdown("#### LLM providers")
         st.markdown(
             """
-            | Provider | Endpoint | Models |
+            | Provider | Key | Main models |
             |---|---|---|
-            | **opencode-free** | `opencode.ai/zen/v1` | live `/models`, curated free ids first |
-            | **groq** | `api.groq.com/openai/v1` | live `/models` when `GROQ_API_KEY` is set |
-            | **nvidia-build** | `integrate.api.nvidia.com/v1` | live `/models` when `NVIDIA_API_KEY` is set |
-            | **kilo-free** | `api.kilo.ai/api/openrouter` | live `/models`, Kilo referer headers |
+            | Groq | `GROQ_API_KEY` | GPT-OSS-120B |
+            | Gemini (free tier) | `GEMINI_API_KEY` | Gemini Flash, newest available version first |
+            | NVIDIA | `NVIDIA_API_KEY` | Nemotron 3 Ultra 550B, Nemotron 3 Super 120B |
+            | Kilo | none needed | free models |
+            | opencode | none needed | free models |
 
-            **Failover:** Auto, or the pinned provider first, then opencode-free →
-            groq → nvidia-build → kilo-free. A model chosen from the live list
-            is tried even when it is not in the built-in fallback list. The
-            picker caches `/models` for 10 minutes and uses the built-in list
-            when the endpoint is down.
+            Auto mode tries them in that order and skips providers without a key
+            and models that are overloaded or recently failed. The full model list
+            loads live from each provider and is shown under Provider status.
             """
         )
 
     st.markdown("---")
     c3, c4 = st.columns(2)
     with c3:
-        st.markdown("#### 🔍 Retrieval (RAG)")
+        st.markdown("#### Method notes")
         st.markdown(
             """
-            - **Corpus** — per-ticker filtered headlines + summaries + computed
-              price context; extendable with peer tickers for sector questions.
-            - **Embeddings** — `all-MiniLM-L6-v2` (384-d, normalized), cached.
-            - **Retrieval** — cosine similarity between the question embedding
-              and every corpus document; top-k returned with relevance score.
-            - **Grounding** — every retrieved story carries provider, date and
-              URL, so any claim the model cites can be traced to its source.
-            - **Scale** — yfinance provides ~10 stories per symbol; the corpus
-              extends across peer tickers for sector-wide queries.
-
-            **Sentiment scoring:** one LLM call scores each headline as
-            +1/0/-1 in strict JSON; unparseable responses fall back to a
-            deterministic financial lexicon (+30/−30 terms) for uninterrupted
-            availability.
+            - **Daily vol:** standard deviation of daily returns, annualized by √252.
+            - **VaR 95% (1d):** 5th percentile of daily returns (historical).
+            - **Max drawdown:** worst peak-to-trough fall of cumulative returns.
+            - **Sharpe:** mean daily return / daily vol × √252, 0% risk-free.
+            - **Leading vs lagging:** RSI, stochastic, rate of change and OBV can
+              turn before price; 50/200-day averages and MACD confirm a trend.
+            - **Relative strength:** return minus NIFTY 50 (India) or S&P 500 (US)
+              over 1, 3 and 6 months.
+            - **Backtest:** long-only daily rule with costs (STT and stamp duty for
+              NSE/BSE), tested on the first 70% of history and again on the last 30%.
             """
         )
     with c4:
-        st.markdown("#### 📐 Risk & Technical Definitions")
+        st.markdown("#### Limitations")
         st.markdown(
             """
-            - **Daily vol** — std of daily returns; **annualized** × √252.
-            - **VaR 95% (1d)** — 5th percentile of the daily-return distribution
-              (historical method).
-            - **Max drawdown** — worst peak-to-trough decline of cumulative returns.
-            - **Sharpe (annual)** — mean daily return ÷ daily vol × √252, 0% risk-free.
-            - **RSI(14)** — momentum oscillator; >70 overbought, <30 oversold.
-            - **MACD(12,26,9)** — EMA difference vs its 9-period signal line.
-            - **Bollinger(20,2)** — 20-day mean ± 2σ band.
-            - **Leading vs lagging** — leading (RSI, stochastic, rate of change,
-              OBV divergence) can turn before price; lagging (50/200-day MA,
-              MACD) confirms a trend once it is under way.
-            - **Relative strength** — stock return minus NIFTY 50 (India) or
-              S&P 500 (US) over 1/3/6 months.
-            - **Backtest** — long-only daily rule, costs per side (Indian STT +
-              stamp duty for NSE/BSE), judged on the first 70% of history and
-              again on the last 30% it never saw, against buy-and-hold.
-
-            *All indicators are computed from live data and shown as facts.
-            Buy/sell questions get evidence, never a call.*
+            - About 10 to 15 headlines per ticker from Yahoo Finance.
+            - Free LLM tiers are rate-limited.
+            - Backtests fill at the signal day's close, cover only stocks still
+              listed, and use approximate costs.
+            - Forecast ranges come from historical volatility; prices can move
+              outside them.
+            - Buy or sell questions get evidence, not a recommendation.
             """
         )
 
-    st.markdown("---")
-    st.markdown("#### 💻 Run & Deploy")
-    st.markdown(
-        """
-        ```bash
-        pip install -r requirements.txt   # streamlit, yfinance, pandas, numpy, plotly, requests, sentence-transformers
-        streamlit run app.py
-        ```
-        **Streamlit Cloud:** push to GitHub → connect → add provider keys as
-        secrets (`OPENCODE_ZEN_API_KEY`, `NVIDIA_API_KEY`, `GROQ_API_KEY`) or
-        leave them in `~/.hermes/.env`. CPU-only (~350 MB RAM), free tier ready.
-
-        #### 🔒 Data & Coverage Notes
-        - News coverage spans the latest ~10–15 headlines per ticker, plus
-          multi-ticker retrieval for sector-wide questions.
-        - Sentiment is computed from headline tone; retrieved stories are
-          attached with provider, date and URL for traceability.
-        - Risk metrics use historical data with clearly documented methods.
-        - Free LLM tiers are rate-limited; the fallback chain keeps answers
-          flowing across opencode-free, Groq, NVIDIA Build, and Kilo.
-        - Uncertainty is quantified as volatility-based ranges, with a standard
-          risk disclaimer attached to every forecast-style answer.
-        - Backtests are optimistic in known ways: fills at the signal day's
-          close, only stocks still listed can be tested (survivorship), costs are
-          approximate. A rule that fails here would fail live; one that passes
-          has only cleared the first bar.
-        """
-    )
-
-    st.markdown("---")
-    st.markdown(
-        '<div style="text-align:center; color:#888; font-size:0.8rem;">'
-        '<b>Real-Time Market Research Assistant</b> · Portfolio Edition · '
-        'yfinance · sentence-transformers · opencode-free + NVIDIA Build + Groq · all figures computed from live data'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown("#### Run locally")
+    st.code("pip install -r requirements.txt\nstreamlit run app.py", language="bash")
+    st.caption("Provider keys go in Streamlit secrets, environment variables, or a .env file next to app.py.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3496,12 +3527,12 @@ def main():
     model = ui["model"]
 
     tabs = st.tabs([
-        "📈 Price Chart",
-        "💬 Ask the Analyst",
-        "🧭 Sentiment",
-        "🛡 Risk & Technical",
-        "📊 Raw Data + News",
-        "📄 Project Overview",
+        "Price Chart",
+        "Ask the Analyst",
+        "Sentiment",
+        "Risk & Technical",
+        "Raw Data + News",
+        "About",
     ])
 
     with tabs[0]:
