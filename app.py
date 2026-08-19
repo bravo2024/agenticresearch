@@ -23,7 +23,9 @@ import sys
 import tempfile
 import textwrap
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
 
 try:
@@ -357,6 +359,26 @@ def benchmark_for(ticker: str) -> str | None:
     return {"india": "^NSEI", "us": "^GSPC", "crypto": "BTC-USD"}.get(market_of(t))
 
 
+# Auto-generated quote/prediction pages are not journalism: Yahoo's own quote-page
+# template, "share price prediction for <day>" spam, and live-price widgets all
+# name the ticker, so `news_relevant` cannot catch them — they are dropped here.
+JUNK_TITLE = re.compile(
+    r"stock price,? news,? quote"       # Yahoo's quote-page template, every region
+    r"|share price prediction for \w+"  # Univest-style auto prediction pages
+    r"|share price today\b"             # templated live-price pages
+    r"|share price\s*[-–]\s*live"       # "Share Price - Live NSE ..."
+    r"|live (nse|bse)\b"                # live quote widgets
+    r"|stock price & chart"             # quote widgets
+    r"|^current price of\b",            # auto price stubs
+    re.I,
+)
+
+
+def junk_title(title: str) -> bool:
+    """True for ticker-naming pages with no reporting in them."""
+    return bool(title) and bool(JUNK_TITLE.search(title))
+
+
 def news_relevant(ticker: str, headline: str, summary: str = "") -> bool:
     """True if a headline plausibly concerns the ticker (symbol or company names)."""
     text = (headline + " " + (summary or "")).lower()
@@ -365,6 +387,15 @@ def news_relevant(ticker: str, headline: str, summary: str = "") -> bool:
         return True
     aliases = COMPANY_NAMES.get(ticker, [])
     return any(a in text for a in aliases)
+
+
+# A headline older than this is archive, not news. Google's RSS "when:7d" hint is
+# not honoured for index and low-volume queries — ^NSEI was serving 65-day-old
+# stories as current — so the floor is enforced here on the merged feed.
+NEWS_MAX_AGE_DAYS = 7
+
+# Browser-ish UA: several publishers 403 the default python-requests agent.
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 PERIOD_FOR_INTERVAL = {
     "1m": "7d", "2m": "60d", "5m": "60d", "15m": "60d", "30m": "60d", "90m": "60d",
@@ -904,18 +935,25 @@ def _calendar(ticker: str) -> dict:
     return out
 
 
-def get_news(ticker: str, limit: int = 12) -> list[dict]:
+def get_news(ticker: str, limit: int = 12, max_age_days: int = NEWS_MAX_AGE_DAYS) -> list[dict]:
     """Empty list when Yahoo refuses; not cached, so the next run tries again."""
     try:
-        return _news(ticker, limit)
+        return _news(ticker, limit, max_age_days)
     except Exception:
         return []
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _news(ticker: str, limit: int) -> list[dict]:
-    news = _yf_call(lambda: yf.Ticker(ticker).news) or []
+def _news(ticker: str, limit: int, max_age_days: int = NEWS_MAX_AGE_DAYS) -> list[dict]:
+    """Yahoo's per-ticker feed first. That endpoint now answers 404 and
+    yfinance returns an empty list, so Yahoo search news and then Google News
+    fill in. NSE/BSE symbols get nothing from Yahoo search by symbol, only by
+    company name, which is why the name is looked up."""
     items = []
+    try:
+        news = _yf_call(lambda: yf.Ticker(ticker).news) or []
+    except Exception:
+        news = []
     for n in news[:limit]:
         c = n.get("content", {})
         items.append({
@@ -927,24 +965,138 @@ def _news(ticker: str, limit: int) -> list[dict]:
             "url": (c.get("canonicalUrl") or {}).get("url", "")
                    if isinstance(c.get("canonicalUrl"), dict) else "",
         })
+    if len(items) < 5:
+        name, kind = asset_name(ticker)
+        items += _search_news(ticker, name, limit, max_age_days)
+        if sum(1 for n in items if n.get("_about")) < 5:
+            query = f"{name} stock" if kind == "EQUITY" else (name or ticker)
+            items += _google_news(query, market_of(ticker) == "india", limit, max_age_days)
+    # Filter for relevance BEFORE truncating to `limit`. Sorting first and cutting
+    # let recent-but-irrelevant Yahoo search hits (whole sectors, via
+    # relatedTickers) crowd out the relevant RSS stories — NVDA was handing back
+    # 3 headlines out of 19 relevant ones available. On a title tie the directly
+    # fetchable URL wins, because a Google News redirect link has no publisher
+    # page to extract full text from server-side.
+    pool = [n for n in items
+            if n["title"] and news_relevant(ticker, n["title"], n.get("summary", ""))
+            and not junk_title(n["title"])]
+    best: dict[str, dict] = {}
+    for n in pool:
+        key = n["title"].lower()
+        cur = best.get(key)
+        if cur is None:
+            best[key] = n
+            continue
+        cur_google = "news.google.com" in (cur.get("url") or "")
+        new_google = "news.google.com" in (n.get("url") or "")
+        if (cur_google and not new_google) or \
+                (cur_google == new_google and n["date"] > cur["date"]):
+            best[key] = n
+    return sorted(best.values(), key=lambda n: n["date"], reverse=True)[:limit]
+
+
+_NAME_TAIL = re.compile(r"\s*\b(limited|ltd\.?|inc\.?|corporation|corp\.?|plc|usd|"
+                        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec) \d{2})$", re.I)
+
+
+def asset_name(ticker: str) -> tuple[str, str]:
+    """Plain name and Yahoo quote type for a symbol, e.g. ("Tata Consultancy
+    Services", "EQUITY") for TCS.NS or ("Gold", "FUTURE") for GC=F."""
+    try:
+        return _asset_name(ticker)
+    except Exception:
+        return "", ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _asset_name(ticker: str) -> tuple[str, str]:
+    quotes = _yf_call(lambda: yf.Search(ticker, max_results=3, raise_errors=True).quotes) or []
+    for q in quotes:
+        if q.get("symbol", "").upper() == ticker.upper():
+            name = q.get("longname") or q.get("shortname") or ""
+            for _ in range(2):
+                name = _NAME_TAIL.sub("", name).strip(" ,.")
+            return name, q.get("quoteType", "")
+    return "", ""
+
+
+def _search_news(ticker: str, name: str, limit: int,
+                 max_age_days: int = NEWS_MAX_AGE_DAYS) -> list[dict]:
+    items = []
+    cutoff = time.time() - max_age_days * 86400
+    for query in dict.fromkeys(q for q in (ticker, name) if q):
+        try:
+            found = yf.Search(query, news_count=limit, max_results=1).news or []
+        except Exception:
+            continue
+        for n in found:
+            ts = n.get("providerPublishTime")
+            if ts and ts < cutoff:
+                continue
+            related = [t.upper() for t in n.get("relatedTickers") or []]
+            items.append({
+                "title": n.get("title", ""),
+                "summary": "",
+                "date": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else "",
+                "provider": n.get("publisher", ""),
+                "url": n.get("link", ""),
+                "_about": ticker.upper() in related
+                          or bool(name) and name.lower() in n.get("title", "").lower(),
+            })
     return items
 
 
-def get_ticker_news(ticker: str, limit: int = 15) -> list[dict]:
-    """Ticker-relevant news only — yfinance's feed is market-wide, so we
-    filter by symbol / company-name aliases. Returns the filtered set when
-    at least one headline matches; falls back to top stories otherwise
-    (flagged so the UI/agent can be honest about coverage)."""
-    all_news = get_news(ticker, limit=limit)
-    relevant = [n for n in all_news if news_relevant(ticker, n["title"], n.get("summary", ""))]
-    if relevant:
-        for n in relevant:
-            n["_filtered"] = True
-        return relevant
-    # Fallback: market-wide top stories, clearly labelled
-    for n in all_news[:5]:
-        n["_filtered"] = False
-    return all_news[:5]
+def _google_news(query: str, india: bool, limit: int,
+                 max_age_days: int = NEWS_MAX_AGE_DAYS) -> list[dict]:
+    """Google News RSS search. Google's `when:Nd` hint is advisory only — index
+    and low-volume queries return months-old items — so the age floor is enforced
+    on the parsed dates rather than trusted."""
+    from email.utils import parsedate_to_datetime
+    import xml.etree.ElementTree as ET
+    region = {"hl": "en-IN", "gl": "IN", "ceid": "IN:en"} if india else \
+             {"hl": "en-US", "gl": "US", "ceid": "US:en"}
+    try:
+        r = requests.get("https://news.google.com/rss/search",
+                         params={"q": f"{query} when:{max_age_days}d", **region},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        entries = ET.fromstring(r.content).findall(".//item")
+    except Exception:
+        return []
+    items = []
+    cutoff = time.time() - max_age_days * 86400
+    for e in entries:
+        source = e.findtext("source") or ""
+        title = e.findtext("title") or ""
+        if source and title.endswith(" - " + source):
+            title = title[: -len(source) - 3]
+        try:
+            published = parsedate_to_datetime(e.findtext("pubDate"))
+        except (TypeError, ValueError):
+            continue                      # no readable date: drop rather than pass stale
+        if published.timestamp() < cutoff:
+            continue
+        items.append({"title": title, "summary": "",
+                      "date": published.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      "provider": source, "url": e.findtext("link") or "",
+                      "_about": True})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def get_ticker_news(ticker: str, limit: int = 15,
+                    max_age_days: int = NEWS_MAX_AGE_DAYS) -> list[dict]:
+    """Ticker-relevant news only. yfinance's per-ticker feed is empty, and Yahoo's
+    search feed tags headlines by `relatedTickers`, which is loose enough to hand
+    back whole sectors (Cirrus Logic and Broadcom on an AAPL query), so every
+    headline must independently survive `news_relevant`. When nothing matches,
+    this returns nothing rather than unrelated market-wide stories — scoring
+    market noise against a ticker is worse than reporting no coverage."""
+    news = get_news(ticker, limit=limit, max_age_days=max_age_days)
+    for n in news:
+        n["_filtered"] = True
+    return news
 
 
 def risk_metrics(ticker: str) -> dict:
@@ -2104,18 +2256,21 @@ def lexicon_score(text: str) -> float:
 
 def sentiment_score(ticker: str, lookback_days: int = 7,
                     provider: str = "", model: str = "") -> dict:
-    news = get_ticker_news(ticker, limit=15)
+    # The lookback slider drives the fetch window, not just a post-hoc filter,
+    # so asking for 30 days really pulls 30 days of headlines.
+    news = get_ticker_news(ticker, limit=15, max_age_days=lookback_days)
     if not news:
         return {"error": "no recent news"}
 
-    any_filtered = any(n.get("_filtered") for n in news)
-    news_source = "ticker-filtered" if any_filtered else "market-wide-fallback"
+    news_source = "ticker-filtered"
 
     windowed = []
-    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     for n in news:
         try:
-            d = datetime.fromisoformat(n["date"].replace("Z", "+00:00")).replace(tzinfo=None)
+            d = datetime.fromisoformat(n["date"].replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
             n["_dt"] = d
             if d >= cutoff:
                 windowed.append(n)
@@ -2644,7 +2799,7 @@ def answer_question(question: str, provider: str = "", model: str = "",
 # UI HELPERS
 # ─────────────────────────────────────────────────────────────
 def fresh_stamp() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") + " UTC"
 
 
 def link_html(url: str, text: str | None = None) -> str:
@@ -2652,21 +2807,113 @@ def link_html(url: str, text: str | None = None) -> str:
     if not url:
         return ""
     label = text or "Read full story ↗"
-    return f'<a class="src-link" href="{url}" target="_blank" rel="noopener noreferrer">{label}</a>'
+    return (f'<a class="src-link" href="{escape(url, quote=True)}" target="_blank" '
+            f'rel="noopener noreferrer">{escape(label)}</a>')
 
 
-def render_story_card(s: dict, show_summary: bool = False):
-    meta = f'{s["provider"]} · {s["date"]}'
-    link = link_html(s.get("url", ""), "Read full story ↗")
+class _ReadableText(HTMLParser):
+    """Pull paragraph text out of an article page, dropping page chrome."""
+    SKIP = {"script", "style", "noscript", "nav", "header", "footer", "aside",
+            "form", "svg", "figure", "iframe", "button"}
+    KEEP = {"p", "h1", "h2", "h3", "article", "li", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._skip = 0
+        self._keep = 0
+        self._buf: list[str] = []
+        self.chunks: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag in self.KEEP and self._skip == 0:
+            self._keep += 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self._skip = max(0, self._skip - 1)
+        elif tag in self.KEEP and self._keep:
+            self._keep -= 1
+            text = " ".join("".join(self._buf).split())
+            if len(text) >= 45:          # skip captions, bylines, nav stubs
+                self.chunks.append(text)
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._skip == 0 and self._keep:
+            self._buf.append(data)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def article_text(url: str, max_chars: int = 6000) -> dict:
+    """Fetch a story and return its readable body text (stdlib extraction).
+
+    Google News redirect links resolve client-side, so there is no publisher
+    page to fetch server-side — those return an explanatory error and the UI
+    points at the Read link instead of pretending."""
+    if not url:
+        return {"error": "no url", "url": url}
+    if "news.google.com/rss/articles/" in url:
+        return {"error": "Google News redirect — opens in your browser via the Read link",
+                "url": url}
+    try:
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20,
+                         allow_redirects=True)
+        r.raise_for_status()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {str(exc)[:110]}", "url": url}
+
+    parser = _ReadableText()
+    try:
+        parser.feed(r.text)
+    except Exception:
+        pass
+
+    paras, seen = [], set()
+    for chunk in parser.chunks:
+        key = chunk[:80].lower()
+        if key in seen:                  # publishers repeat the lede as a standfirst
+            continue
+        seen.add(key)
+        paras.append(chunk)
+    body = "\n\n".join(paras)[:max_chars].strip()
+    if not body:                         # paywall / JS-only page: fall back to meta
+        m = re.search(r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\']'
+                      r'[^>]+content=["\']([^"\']+)', r.text, re.I)
+        body = unescape(m.group(1).strip()) if m else ""
+    if not body:
+        return {"error": "no readable text (paywall or script-rendered page)", "url": url}
+    return {"text": body, "chars": len(body), "url": url}
+
+
+def render_story_card(s: dict, show_summary: bool = False, article: dict | None = None):
+    url = s.get("url", "")
+    title_text = escape(s.get("title") or "untitled")
+    if url:
+        title_html = (f'<a href="{escape(url, quote=True)}" target="_blank" '
+                      f'rel="noopener noreferrer" style="color:inherit;'
+                      f'text-decoration:none;border-bottom:1px dotted #999;">{title_text}</a>')
+    else:
+        title_html = title_text
+    meta = escape(f'{s["provider"]} · {s["date"]}')
+    link = link_html(url, "Read full story ↗")
     html = (
-        f'<div class="card"><small><b>{s["title"]}</b> '
+        f'<div class="card"><small><b>{title_html}</b> '
         f'<span class="tag tag-gold">{s["score"]:+.1f}</span></small><br>'
         f'<small style="color:#777;">{meta} · {link}</small>'
     )
     if show_summary and s.get("summary"):
-        html += f'<br><small style="color:#444;">{s["summary"][:220]}</small>'
+        html += f'<br><small style="color:#444;">{escape(s["summary"][:220])}</small>'
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+    if article is not None:
+        if article.get("error"):
+            st.caption(f"Full text unavailable — {article['error']}")
+        elif article.get("text"):
+            with st.expander(f"Full article text · {article['chars']:,} chars"):
+                for para in article["text"].split("\n\n"):
+                    st.markdown(escape(para))
 
 
 def hero():
@@ -3327,9 +3574,15 @@ def sentiment_tab(ticker: str, lookback: int, provider: str, model: str):
         st.bar_chart(daily_df.set_index("date"))
 
     st.markdown("---")
+    load_full = st.toggle(
+        "Load full article text",
+        value=False,
+        help="Fetches each story and extracts its readable body. Slower: one request per headline.",
+    )
     st.markdown("**All scored headlines (ranked by score magnitude)**")
     for s in res["stories"]:
-        render_story_card(s, show_summary=True)
+        art = article_text(s.get("url", "")) if load_full else None
+        render_story_card(s, show_summary=True, article=art)
 
 
 # ── Tab 4: Risk & Technical ──
@@ -3395,15 +3648,31 @@ def data_tab(ticker: str, interval: str):
     news = get_news(ticker, limit=10)
     if not news:
         st.info("No recent news.")
+    load_full = st.toggle("Load full article text", value=False, key="data_tab_full_news",
+                          help="Fetches each story and extracts its readable body.")
     for n in news:
-        link = link_html(n.get("url", ""), "Read full story ↗")
-        summary_html = f'<br><small style="color:#444;">{n["summary"][:200]}</small>' if n.get("summary") else ""
+        url = n.get("url", "")
+        link = link_html(url, "Read full story ↗")
+        summary_html = (f'<br><small style="color:#444;">{escape(n["summary"][:200])}</small>'
+                        if n.get("summary") else "")
+        title_text = escape(n.get("title") or "untitled")
+        title_html = (f'<a href="{escape(url, quote=True)}" target="_blank" '
+                      f'rel="noopener noreferrer" style="color:inherit;text-decoration:none;'
+                      f'border-bottom:1px dotted #999;">{title_text}</a>') if url else title_text
         st.markdown(
-            f'<div class="card"><small><b>{n["title"]}</b></small><br>'
-            f'<small style="color:#777;">{n["provider"]} · {n["date"][:10]} · {link}</small>'
+            f'<div class="card"><small><b>{title_html}</b></small><br>'
+            f'<small style="color:#777;">{escape(n["provider"])} · {n["date"][:10]} · {link}</small>'
             f'{summary_html}</div>',
             unsafe_allow_html=True,
         )
+        if load_full:
+            art = article_text(url)
+            if art.get("error"):
+                st.caption(f"Full text unavailable — {art['error']}")
+            elif art.get("text"):
+                with st.expander(f"Full article text · {art['chars']:,} chars"):
+                    for para in art["text"].split("\n\n"):
+                        st.markdown(escape(para))
 
 
 # ── Tab 6: About ──
